@@ -1,0 +1,191 @@
+# ac011k.yaml
+# ESPHome configuration for the EN+ / Autoaid AC011K EV charger.
+#
+# Flash command (serial, board in flash mode — connect GPIO0 to GND):
+#   esptool.py --chip esp32 --baud 921600 --port /dev/ttyUSBx \
+#     --before default_reset --after hard_reset write_flash 0x0 ac011k.bin
+# Subsequent updates: esphome run ac011k.yaml  (OTA)
+
+esphome:
+  name: ac011k-charger
+  friendly_name: "EN+ AC011K EV Charger"
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+# Pull in the custom PrivComm component from the local components/ directory
+external_components:
+  - source:
+      type: local
+      path: components
+
+logger:
+  level: INFO        # set to DEBUG to see all PrivComm frame dispatching
+  baud_rate: 0       # disable serial logger (keeps GPIO1/3 free)
+
+api:
+  encryption:
+    key: !secret ha_api_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "ac011k-fallback"
+    password: !secret fallback_ap_password
+
+captive_portal:
+
+# NTP time — the GD chip requests UTC time on every heartbeat (~60s).
+# The component falls back to a static date until NTP syncs.
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: Europe/Berlin   # adjust to your timezone
+
+# ── PrivComm UART ──────────────────────────────────────────────────────────────
+uart:
+  id: privcomm_uart
+  tx_pin: GPIO27
+  rx_pin: GPIO26
+  baud_rate: 115200
+  stop_bits: 1
+  data_bits: 8
+  parity: NONE
+  rx_buffer_size: 1024
+
+# ── AC011K hub — registers the component and binds it to the UART ─────────────
+ac011k:
+  id: ac011k_hub
+  uart_id: privcomm_uart
+
+# ── Meter sensors ──────────────────────────────────────────────────────────────
+sensor:
+  - platform: ac011k
+    ac011k_id: ac011k_hub
+    power:
+      name: "Charger Power"
+    voltage_l1:
+      name: "Charger L1 Voltage"
+    voltage_l2:
+      name: "Charger L2 Voltage"
+    voltage_l3:
+      name: "Charger L3 Voltage"
+    current_l1:
+      name: "Charger L1 Current"
+    current_l2:
+      name: "Charger L2 Current"
+    current_l3:
+      name: "Charger L3 Current"
+    energy_session:
+      name: "Charger Session Energy"
+    energy_total:
+      name: "Charger Total Energy"
+    evse_status:
+      name: "Charger EVSE Status"
+      entity_category: diagnostic
+      # 1=Available  2=Preparing(plugged)  3=Charging  4=Suspended by charger
+      # 5=Suspended by EV  6=Finishing  7=Reserved  8=Unavailable  9=Fault
+
+# ── Charging-state binary sensors ─────────────────────────────────────────────
+binary_sensor:
+  - platform: ac011k
+    ac011k_id: ac011k_hub
+    plugged:
+      name: "Charger Cable Plugged"
+      id: ev_plugged
+    charging:
+      name: "Charger Charging Active"
+      id: ev_charging
+
+  - platform: gpio
+    name: "Charger Button"
+    pin:
+      number: GPIO32
+      inverted: true
+      mode:
+        input: true
+        pullup: true
+
+# ── LEDs ───────────────────────────────────────────────────────────────────────
+output:
+  - platform: gpio
+    id: green_led_out
+    pin:
+      number: GPIO25
+      inverted: true   # active LOW
+
+  - platform: gpio
+    id: red_led_out
+    pin:
+      number: GPIO33
+      inverted: true   # active LOW
+
+light:
+  - platform: binary
+    id: green_led
+    name: "Charger Green LED"
+    output: green_led_out
+
+  - platform: binary
+    id: red_led
+    name: "Charger Red LED"
+    output: red_led_out
+
+# ── Charging control ────────────────────────────────────────────────────────────
+#
+# Lifecycle:
+#  1. Plug in cable → EVSE status 2 (Preparing)
+#  2. Press "Start Charging" → ESP sends A6 start + AF current-limit to GD
+#  3. GD sends 0x07 approval → ESP confirms with A7 → status 3 (Charging)
+#  4. Press "Stop Charging"  → ESP sends A6 stop → status 6/1
+button:
+  - platform: template
+    name: "Start Charging"
+    icon: mdi:ev-plug-type2
+    on_press:
+      - lambda: 'id(ac011k_hub).start_charging();'
+
+  - platform: template
+    name: "Stop Charging"
+    icon: mdi:stop-circle
+    on_press:
+      - lambda: 'id(ac011k_hub).stop_charging();'
+
+# ── Current limit slider (6–16 A) ─────────────────────────────────────────────
+number:
+  - platform: template
+    name: "Charging Current Limit"
+    unit_of_measurement: "A"
+    icon: mdi:current-ac
+    min_value: 6
+    max_value: 16
+    step: 1
+    initial_value: 16
+    optimistic: true
+    set_action:
+      - lambda: 'id(ac011k_hub).set_current_limit((uint8_t)x);'
+
+# ── LED feedback: blink green while charging, solid while plugged ──────────────
+interval:
+  - interval: 1s
+    then:
+      - if:
+          condition:
+            binary_sensor.is_on: ev_charging
+          then:
+            - light.toggle: green_led
+          else:
+            - if:
+                condition:
+                  binary_sensor.is_on: ev_plugged
+                then:
+                  - light.turn_on: green_led
+                else:
+                  - light.turn_off: green_led
