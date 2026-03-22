@@ -148,6 +148,18 @@ public:
 
     uint8_t get_current_limit() const { return current_limit_a_; }
 
+    // Switch between 1-phase and 3-phase charging (cmdAACtrlSetChgphase, AA 18 52).
+    // phases must be 1 or 3. Takes effect immediately.
+    void set_phases(uint8_t phases) {
+        if (phases != 1 && phases != 3) return;
+        phases_ = phases;
+        uint8_t cmd[6] = {0xAA, 0x18, 0x52, 0x01, 0x00, phases};
+        send_frame(cmd, sizeof(cmd), seq_++);
+        ESP_LOGI(TAG, "set_phases(%d)", phases);
+    }
+
+    uint8_t get_phases() const { return phases_; }
+
     // ── ESPHome lifecycle ─────────────────────────────────────────────────────
     void setup() override {
         // Build mutable stop command with transaction number embedded as ASCII.
@@ -288,6 +300,7 @@ private:
 
     uint8_t  seq_              = 1;      // outgoing sequence number
     uint8_t  current_limit_a_  = 16;    // amperes
+    uint8_t  phases_           = 3;     // 1 or 3
     uint32_t tx_num_           = 100000; // transaction number (embedded in A6/A7 cmds)
 
     // Mutable command buffers with transaction number patched in at setup()

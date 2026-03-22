@@ -5,6 +5,18 @@
 #   esptool.py --chip esp32 --baud 921600 --port /dev/ttyUSBx \
 #     --before default_reset --after hard_reset write_flash 0x0 ac011k.bin
 # Subsequent updates: esphome run ac011k.yaml  (OTA)
+#
+# Power control logic:
+#   - "Target Power" (W) is the primary control: it drives both phase selection
+#     and per-phase current automatically.
+#   - Phase Mode "Auto": ≤ 3680 W → 1-phase, > 3680 W → 3-phase.
+#   - Phase Mode "1-Phase" / "3-Phase": forced, current calculated accordingly.
+#   - Auto-Start: when enabled the charger starts automatically on plug-in.
+#
+# Phase / power limits (230 V grid):
+#   1-phase:  6 A × 230 V =  1380 W  ...  16 A × 230 V =  3680 W
+#   3-phase:  6 A × 690 V =  4140 W  ...  16 A × 690 V = 11040 W
+#   (3-phase minimum requires > 3680 W target in Auto mode)
 
 esphome:
   name: ac011k-charger
@@ -13,17 +25,15 @@ esphome:
 esp32:
   board: esp32dev
   framework:
-    type: arduino
+    type: esp-idf
 
-# Pull in the custom PrivComm component from the local components/ directory
 external_components:
   - source:
       type: local
       path: components
 
 logger:
-  level: INFO        # set to DEBUG to see all PrivComm frame dispatching
-  baud_rate: 0       # disable serial logger (keeps GPIO1/3 free)
+  level: DEBUG
 
 api:
   encryption:
@@ -42,8 +52,15 @@ wifi:
 
 captive_portal:
 
-# NTP time — the GD chip requests UTC time on every heartbeat (~60s).
-# The component falls back to a static date until NTP syncs.
+#ethernet:
+#  type: IP101          # Firmware confirmed: esp_eth_phy_new_ip101 (was LAN8720)
+#  mdc_pin: GPIO23      # Confirmed: eth_mac_config_t in DROM at 0x3f4bac40
+#  mdio_pin: GPIO18     # Confirmed: eth_mac_config_t in DROM at 0x3f4bac44
+#  clk_mode: GPIO0_IN   # External oscillator; no evidence of CLK output mode
+#  phy_addr: 1          # Firmware uses auto-detect (-1); PHY typically found at 1
+#  power_pin: GPIO5     # Confirmed: eth_phy_config_t reset_gpio_num=5 at 0x3f4bac58
+
+# NTP — GD32 requests UTC time on every heartbeat.
 time:
   - platform: sntp
     id: sntp_time
@@ -52,15 +69,15 @@ time:
 # ── PrivComm UART ──────────────────────────────────────────────────────────────
 uart:
   id: privcomm_uart
-  tx_pin: GPIO27
-  rx_pin: GPIO26
+  tx_pin: GPIO32   # Confirmed: uart_set_pin(UART1, tx=32, rx=34) at 0x4014633D in firmware
+  rx_pin: GPIO34   # Confirmed: GPIO34 is input-only, correct for RX
   baud_rate: 115200
   stop_bits: 1
   data_bits: 8
   parity: NONE
   rx_buffer_size: 1024
 
-# ── AC011K hub — registers the component and binds it to the UART ─────────────
+# ── AC011K hub ─────────────────────────────────────────────────────────────────
 ac011k:
   id: ac011k_hub
   uart_id: privcomm_uart
@@ -71,6 +88,7 @@ sensor:
     ac011k_id: ac011k_hub
     power:
       name: "Charger Power"
+      id: charger_power
     voltage_l1:
       name: "Charger L1 Voltage"
     voltage_l2:
@@ -93,63 +111,89 @@ sensor:
       # 1=Available  2=Preparing(plugged)  3=Charging  4=Suspended by charger
       # 5=Suspended by EV  6=Finishing  7=Reserved  8=Unavailable  9=Fault
 
-# ── Charging-state binary sensors ─────────────────────────────────────────────
+# ── State binary sensors ───────────────────────────────────────────────────────
 binary_sensor:
   - platform: ac011k
     ac011k_id: ac011k_hub
     plugged:
       name: "Charger Cable Plugged"
       id: ev_plugged
+      on_press:
+        # Auto-start: when cable is inserted and auto-start is enabled, start charging.
+        # Small delay gives GD32 time to settle in "Preparing" state.
+        - if:
+            condition:
+              switch.is_on: auto_start_switch
+            then:
+              - delay: 1500ms
+              - script.execute: apply_charging_settings
+              - lambda: 'id(ac011k_hub).start_charging();'
     charging:
       name: "Charger Charging Active"
       id: ev_charging
-
   - platform: gpio
-    name: "Charger Button"
-    pin:
-      number: GPIO32
-      inverted: true
-      mode:
-        input: true
-        pullup: true
+    pin: GPIO36
+    name: "Living Room Window"
+  # NOTE: GPIO32 is UART1 TX (confirmed from firmware), so it cannot be used as a button.
+  # GPIO34 is UART1 RX. The physical button GPIO is unknown — needs hardware tracing.
+  # - platform: gpio
+  #   name: "Charger Button"
+  #   pin:
+  #     number: GPIO32   # WRONG: this is UART1 TX
+  #     inverted: true
+  #     mode:
+  #       input: true
+  #       pullup: true
 
-# ── LEDs ───────────────────────────────────────────────────────────────────────
-output:
-  - platform: gpio
-    id: green_led_out
-    pin:
-      number: GPIO25
-      inverted: true   # active LOW
+# ── Controls ───────────────────────────────────────────────────────────────────
 
-  - platform: gpio
-    id: red_led_out
-    pin:
-      number: GPIO33
-      inverted: true   # active LOW
+switch:
+  # Toggle: automatically start charging when cable is plugged in.
+  - platform: template
+    name: "Auto-Start Charging"
+    id: auto_start_switch
+    icon: mdi:ev-plug-type2
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
 
-light:
-  - platform: binary
-    id: green_led
-    name: "Charger Green LED"
-    output: green_led_out
+select:
+  # Phase mode: Auto switches at the 3680 W boundary (16 A × 1φ × 230 V).
+  - platform: template
+    name: "Phase Mode"
+    id: phase_mode_select
+    icon: mdi:sine-wave
+    options:
+      - "Auto"
+      - "1-Phase"
+      - "3-Phase"
+    initial_option: "Auto"
+    optimistic: true
+    restore_value: true
+    set_action:
+      - script.execute: apply_charging_settings
 
-  - platform: binary
-    id: red_led
-    name: "Charger Red LED"
-    output: red_led_out
+number:
+  # Target charging power in watts. Drives phase selection + per-phase current.
+  - platform: template
+    name: "Target Charging Power"
+    id: target_power
+    unit_of_measurement: "W"
+    icon: mdi:flash
+    min_value: 1380    # 6 A × 230 V (1-phase minimum)
+    max_value: 11040   # 16 A × 690 V (3-phase maximum)
+    step: 100
+    initial_value: 3680  # 16 A × 1-phase — safe default for all setups
+    optimistic: true
+    restore_value: true
+    set_action:
+      - script.execute: apply_charging_settings
 
-# ── Charging control ────────────────────────────────────────────────────────────
-#
-# Lifecycle:
-#  1. Plug in cable → EVSE status 2 (Preparing)
-#  2. Press "Start Charging" → ESP sends A6 start + AF current-limit to GD
-#  3. GD sends 0x07 approval → ESP confirms with A7 → status 3 (Charging)
-#  4. Press "Stop Charging"  → ESP sends A6 stop → status 6/1
 button:
   - platform: template
     name: "Start Charging"
-    icon: mdi:ev-plug-type2
+    icon: mdi:play-circle
     on_press:
+      - script.execute: apply_charging_settings
       - lambda: 'id(ac011k_hub).start_charging();'
 
   - platform: template
@@ -158,34 +202,45 @@ button:
     on_press:
       - lambda: 'id(ac011k_hub).stop_charging();'
 
-# ── Current limit slider (6–16 A) ─────────────────────────────────────────────
-number:
-  - platform: template
-    name: "Charging Current Limit"
-    unit_of_measurement: "A"
-    icon: mdi:current-ac
-    min_value: 6
-    max_value: 16
-    step: 1
-    initial_value: 16
-    optimistic: true
-    set_action:
-      - lambda: 'id(ac011k_hub).set_current_limit((uint8_t)x);'
-
-# ── LED feedback: blink green while charging, solid while plugged ──────────────
-interval:
-  - interval: 1s
+# ── Core logic script ──────────────────────────────────────────────────────────
+# Calculates phase count and per-phase amperes from target_power + phase_mode_select,
+# then pushes both to the GD32 over PrivComm.
+#
+# Auto-mode boundary: 3680 W = 16 A × 1φ × 230 V
+#   ≤ 3680 W → 1-phase,  amps = power / 230        (clamped 6–16 A)
+#   > 3680 W → 3-phase,  amps = power / (3 × 230)  (clamped 6–16 A)
+#
+# Note: switching phases during an active session is supported by the GD32 firmware
+# (cmdAACtrlSetChgphase / AA 18 52). The GD32 handles the hardware transition.
+script:
+  - id: apply_charging_settings
     then:
-      - if:
-          condition:
-            binary_sensor.is_on: ev_charging
-          then:
-            - light.toggle: green_led
-          else:
-            - if:
-                condition:
-                  binary_sensor.is_on: ev_plugged
-                then:
-                  - light.turn_on: green_led
-                else:
-                  - light.turn_off: green_led
+      - lambda: |-
+          float power = id(target_power).state;
+          std::string mode = id(phase_mode_select).state;
+
+          uint8_t phases;
+          float amps_f;
+
+          if (mode == "1-Phase") {
+              phases  = 1;
+              amps_f  = power / 230.0f;
+          } else if (mode == "3-Phase") {
+              phases  = 3;
+              amps_f  = power / (3.0f * 230.0f);
+          } else {
+              // Auto: use 1-phase up to the 16 A limit, then switch to 3-phase
+              if (power <= 3680.0f) {
+                  phases = 1;
+                  amps_f = power / 230.0f;
+              } else {
+                  phases = 3;
+                  amps_f = power / (3.0f * 230.0f);
+              }
+          }
+
+          uint8_t amps = (uint8_t) std::max(6.0f, std::min(16.0f, amps_f));
+          ESP_LOGI("ac011k", "apply: %.0f W  mode=%s  -> %d-phase @ %d A",
+                   power, mode.c_str(), phases, amps);
+          id(ac011k_hub).set_phases(phases);
+          id(ac011k_hub).set_current_limit(amps);

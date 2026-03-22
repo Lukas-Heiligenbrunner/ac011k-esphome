@@ -13,8 +13,8 @@ AC011K wallbox hardware.
 | Parameter | Value |
 |-----------|-------|
 | Interface | UART (Serial2 on ESP32) |
-| RX pin (ESP32 input) | GPIO 26 |
-| TX pin (ESP32 output) | GPIO 27 |
+| RX pin (ESP32 input) | **TBD** — GPIO 26/27 conflict with RMII Ethernet; actual pins under investigation |
+| TX pin (ESP32 output) | **TBD** — see above |
 | Baud rate | 115200 |
 | Frame format | 8N1 |
 | RX buffer (ESP32) | 1024 bytes |
@@ -135,31 +135,57 @@ All byte offsets are absolute positions within the raw receive buffer (0 = first
 ### 4.1 CMD 0x02 — InfoSync (SN / HW / FW)
 
 Sent spontaneously by GD32 after every reset or boot. Triggered by sending `SetReset`
-(0xAA sub-command 0x12).
+(0xAA sub-command 0x12). The GD32 continues re-sending this frame every ~10 s until
+the ESP32 enters normal operation; the ESP32 must reply with 0xA2 on every occurrence.
 
-| Offset | Content |
-|--------|---------|
-| 8..39  | Serial number (null-terminated ASCII, 32 bytes) |
-| 43..74 | Hardware model string, e.g. `AC011K-AU-25` (32 bytes) |
-| 91..106| GD firmware version string, e.g. `1.1.538` (16 bytes) |
+Total frame: **177 bytes** (LEN = 167).
 
-Known hardware models: `AC011K-AU-25`, `AC011K-AE-25`, `AC011K-AU-25-STL`, `AC011K-AE-25-STL`
+| Offset | Size | Content |
+|--------|------|---------|
+| 8..39  | 32 B | Serial number, null-padded ASCII, e.g. `SN10052404186232` |
+| 40..42 | 3 B  | Unknown (`32 11 00` observed on AE-35 units) |
+| 43..74 | 32 B | Hardware model + optional sub-variant, null-padded, e.g. `AC011K-AE-35\0…\0NEW\0…` |
+| 75..90 | 16 B | Unknown / reserved (all-zero observed) |
+| 91..106 | 16 B | GD firmware version string, e.g. `1.5.279` |
+| 107..143 | 37 B | Unknown / config fields |
+| 144    | 1 B  | **supportRunningMode** bitmask (see below) |
+| 145..174 | 30 B | Padding / unknown (zero) |
+
+**supportRunningMode bitmask (buf[144]):**
+
+| Bit | Meaning |
+|-----|---------|
+| 0 | online mode supported |
+| 1 | offline mode supported |
+| 2 | plug-in auto-start supported |
+| 5 | EMS supported |
+| 6 | BLE supported |
+| 7 | reserved |
+
+Example: `0x65` = 0b01100101 → online=1, offline=0, plug=1, ems=1, ble=1
+
+Known hardware models: `AC011K-AU-25`, `AC011K-AE-25`, `AC011K-AU-25-STL`, `AC011K-AE-25-STL`,
+`AC011K-AE-35`
+
 Known firmware versions (working): `1.0.1435`, `1.1.27`, `1.1.212`, `1.1.258`, `1.1.460`,
-`1.1.525`, `1.1.538`, `1.1.653`, `1.1.805`, `1.1.812`, `1.1.888`, `1.2.653`
+`1.1.525`, `1.1.538`, `1.1.653`, `1.1.805`, `1.1.812`, `1.1.888`, `1.2.653`, `1.5.279`
 
 **ESP32 must reply with 0xA2 ACK** (see §5.1).
 
-Example raw frame:
+Example raw frame (AC011K-AE-35, FW 1.5.279):
 ```
-FA 03 00 00  02  26  7D 00
-53 4E 31 30 30 35 32 31 30 31 31 39 33 35 37 30   ; SN: "SN10052101193570"
+FA 03 00 00  02  02  A7 00
+53 4E 31 30 30 35 32 34 30 34 31 38 36 32 33 32   ; SN: "SN10052404186232"
 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
-00 00 00 00 00 00 00 00 24 D1 00
-41 43 30 31 31 4B 2D 41 55 2D 32 35              ; HW: "AC011K-AU-25"
-00 ...
-31 2E 31 2E 32 37 00 ...                         ; FW: "1.1.27"
-...
-D9 25   ; CRC
+32 11 00                                          ; buf[40..42]: unknown
+41 43 30 31 31 4B 2D 41 45 2D 33 35 00 00 00 00   ; HW: "AC011K-AE-35" (bytes 0..11)
+00 00 00 00 00 00 00 00 4E 45 57 00 00 00 00 00   ;     "NEW" sub-variant at offset 67 in field
+00 00 00 00 00 00 00 00 00 00 00 00               ;     rest zero-padded (total 32 B)
+31 2E 35 2E 32 37 39 00 00 00 00 00 00 00 00 00   ; FW: "1.5.279"
+[37 bytes unknown / config at 107..143]
+65                                                ; buf[144]: supportRunningMode = 0x65
+[30 bytes zero-padded]
+25 80   ; CRC
 ```
 
 ### 4.2 CMD 0x03 — StatusUpdate
@@ -262,19 +288,24 @@ A voltage > 70 V (raw > 700) is used to determine that a phase is physically con
 
 ### 4.9 CMD 0x0A — Control Command Ack
 
-Response to 0xAA commands. Sub-type at `buf[9]`:
+Response to 0xAA commands. Payload structure mirrors the sent command:
+`[type_byte][sub_cmd][len_lo][len_hi][data…]` where the ACK type byte is `0x14`
+(vs `0x10` for GET responses and `0x18` for SET commands).
+
+Sub-type at `buf[9]`:
 
 | Sub-type | Meaning |
 |----------|---------|
-| 0x02 | Time answer (GetRTC / SetRTC response); RTC data at buf[12..17] |
-| 0x08 | Heartbeat timeout confirmation; timeout value at buf[12..13] |
-| 0x09 | Start power mode set confirmation |
+| 0x02 | GetRTC response (type=`0x10`) or SetRTC ack (type=`0x14`); 6-byte UTC time at buf[12..17] |
 | 0x0B | GetMaxCurrLimit answer; max current at buf[12] (e.g. 160 = 16.0 A) |
-| 0x12 | SetReset confirmation |
+| 0x12 | SetReset confirmation; result byte at buf[12] (0 = OK) |
 | 0x24 | ClearChargingProfile confirmation |
 | 0x25 | SetSmartparam confirmation |
-| 0x3E | ClockAlignedDataInterval confirmation; interval at buf[12..13] |
-| 0x3F | SetGunTime confirmation |
+| 0x3A | GetHardwareInfo response; SN at buf[12..27], input voltage ×10 (V) at buf[41..42] (uint16 LE) |
+| 0x3E | ClockAlignedDataInterval confirmation; interval (s) at buf[12..15] (uint32 LE) |
+| 0x3F | SetGunTime confirmation; value at buf[12..13] (uint16 LE) |
+| 0x42 | GetMeterConfig response; see §5.12 |
+| 0x4E | SetWLANConfig confirmation |
 
 ### 4.10 CMD 0x0F — Schedule Request
 
@@ -450,7 +481,44 @@ uses the following sub-commands in order:
 
 | Payload | Description |
 |---------|-------------|
-| `AC 11 0B 01 00 00` | SetRemoteStart = 0 (disable remote start via OCPP server) |
+**0xAA payload structure:** `[type][sub_cmd][len_lo][len_hi][data…]`
+where `type=0x18` = write/set and `type=0x10` = read/get (no data bytes follow for reads).
+**0xAC payload structure:** `[0x11][sub_cmd][len_lo][len_hi][data…]` (always write).
+
+**Init sequence observed in original firmware (log-verified):**
+
+| Payload | Description |
+|---------|-------------|
+| `AA 18 12 01 00 03` | SetReset (triggers 0x02 InfoSync from GD32) — sent **first** |
+| `AA 10 02 00 00` | GetRTC (ESP32 sets its own clock from response) |
+| `AA 10 3A 00 00` | GetHardwareInfo (reads SN, input voltage; see §5.12) |
+| `AA 10 4E 40 00 [SSID 32B][PWD 32B]` | SetWLANConfig — cloud firmware only, not needed for ESPHome |
+| `AA 10 42 00 00` | GetMeterConfig (reads meter type, max current; see §5.12) |
+| `AA 18 12 01 00 03` | SetReset (second time; triggers another 0x02 InfoSync) |
+| `AC 11 0B 01 00 00` | SetRemoteStart = 0 |
+| `AC 11 09 01 00 01` | SetS2OpenStop = **1** ¹ |
+| `AC 11 0A 01 00 00` | SetS2OpenLock = 0 |
+| `AC 11 0C 01 00 00` | SetOfflineStop = 0 |
+| `AA 18 3E 04 00 00 00 00 00` | ClockAlignedDataInterval = **0** ² |
+| `AC 11 0D 04 00 B8 0B 00 00` | SetOfflineEnergy = 3000 Wh |
+| `AA 18 3F 04 00 1E 00 00 00` | SetGunTime = 30 s |
+| `AA 18 25 0E 00 05 00 00 00 05 00 00 00 00 03 00 00 00 02` | SetSmartparam |
+| `AA 18 12 01 00 03` | SetReset (again; original firmware sends this repeatedly) |
+| `AC 11 08 02 00 3C 00` | SetMinChargingCurrent = 60 (= 6.0 A × 10) — see §5.12 |
+| `AA 18 02 06 00 YY MM DD HH MM SS` | SetRTC (write current UTC time to GD32) |
+
+> ¹ **SetS2OpenStop = 1**: The actual firmware uses value `1`, not `0` as was previously
+> documented. The ESPHome init sequence uses `0`; both appear to be accepted by the GD32.
+>
+> ² **ClockAlignedDataInterval = 0**: The original firmware sends `0` here (possibly meaning
+> "use GD32 default"). ESPHome sets it to `10` (seconds) to receive meter data every 10 s.
+> Setting it to `0` with ESPHome would suppress meter data.
+
+**ESPHome simplified init sequence** (omits cloud-specific commands):
+
+| Payload | Description |
+|---------|-------------|
+| `AC 11 0B 01 00 00` | SetRemoteStart = 0 |
 | `AC 11 09 01 00 00` | SetS2OpenStop = 0 |
 | `AC 11 0A 01 00 00` | SetS2OpenLock = 0 |
 | `AC 11 0C 01 00 00` | SetOfflineStop = 0 |
@@ -462,9 +530,81 @@ uses the following sub-commands in order:
 | `AA 18 12 01 00 03` | SetReset (triggers 0x02 InfoSync from GD32) |
 | `AA 18 08 02 00 F0 00` | SetHeartbeatTimeout = 240 s |
 | `AA 18 09 01 00 00` | Init15 (set start power mode) |
-| `AA 18 3F 04 00 1E 00 00 00` | SetGunTime (sent twice) |
+| `AA 18 3F 04 00 1E 00 00 00` | SetGunTime (sent twice in original) |
 | `AA 18 24 05 00 FF FF FF FF 55` | ClearChargingProfile (connectorId=0) |
 | `AA 10 0B 00 00` | GetMaxCurrLimit |
+
+### 5.12 Undocumented / Cloud-Firmware Commands (observed in log)
+
+These commands are sent by the original ESP32 cloud firmware but are **not required**
+for standalone ESPHome operation. Documented here for reference.
+
+**0xAA sub=0x3A — GetHardwareInfo (ESP32→GD32)**
+
+```
+Payload: AA 10 3A 00 00  (GET, no data)
+```
+
+Response (0x0A, sub=0x3A, type=0x10, dlen=124):
+
+| Offset in response data | Content |
+|-------------------------|---------|
+| buf[12..27] | SN string (16 bytes) |
+| buf[41..42] | Input voltage × 10, uint16 LE (e.g. `0x0D15` = 3349 → 232.5 V, but log shows 2325 = 232.5 V) |
+
+The response includes many additional operational parameters (currents, thresholds, etc.)
+that are not fully decoded.
+
+---
+
+**0xAA sub=0x42 — GetMeterConfig (ESP32→GD32)**
+
+```
+Payload: AA 10 42 00 00  (GET, no data)
+```
+
+Response (0x0A, sub=0x42, type=0x10, dlen=7):
+
+| Response byte | Field | Example |
+|---------------|-------|---------|
+| buf[12] | metertype | 10 |
+| buf[13] | meterpro | 20 |
+| buf[14..15] | msxCurr (max current × 10, uint16 LE) | 1000 (= 100.0 A) |
+| buf[16] | PVchgmode | 1 |
+| buf[17] | setChgCurr | 0 |
+
+---
+
+**0xAA sub=0x4E — SetWLANConfig (ESP32→GD32, cloud firmware only)**
+
+```
+Payload: AA 10 4E 40 00 [SSID 32 bytes null-padded] [password 32 bytes null-padded]
+```
+
+Sends the WiFi credentials to the GD32 (or stores them). Only present in the original
+cloud firmware. **Not needed for ESPHome.**
+
+---
+
+**0xAA sub=0x02 SET — SetRTC (ESP32→GD32)**
+
+```
+Payload: AA 18 02 06 00 YY MM DD HH MM SS
+```
+
+Writes the current UTC time to the GD32's RTC. The 6 time bytes use the same format
+as the UTC time format in §10. Confirmed by 0x0A ACK which echoes the time back.
+
+---
+
+**0xAC sub=0x08 — SetMinChargingCurrent**
+
+```
+Payload: AC 11 08 02 00 3C 00
+```
+
+Sets the minimum charging current. Value `0x3C` = 60 = 6.0 A × 10. This matches
+the AC011K hardware minimum of 6 A. Confirmed by 0x0C ACK mirroring the payload.
 
 ---
 
@@ -490,12 +630,19 @@ The GD32 reports a status code in commands 0x03, 0x04, and 0x08:
 
 On every ESP32 boot, the following must be done once before normal operation:
 
-1. Open Serial2 at 115200 8N1, RX=GPIO26, TX=GPIO27.
-2. Send all `0xAA` / `0xAC` init commands listed in §5.11 (in order).
+1. Open UART at 115200 8N1 (RX/TX pins: see §11).
+2. Send all `0xAA` / `0xAC` init commands listed in §5.11 ESPHome sequence (in order).
 3. The `SetReset` command triggers the GD32 to send a `0x02 InfoSync` frame.
+   The GD32 will re-send `0x02` approximately every 10 s until the ESP32 is fully
+   initialised. The ESP32 must reply with `0xA2` ACK to each one.
 4. Extract serial number, hardware model and firmware version from `0x02`.
-5. Patch the transaction number into the A6/A7 command buffers (`sprintf("%06d", txNum)`).
-6. Begin normal receive loop.
+5. Parse `supportRunningMode` from buf[144] if needed.
+6. Patch the transaction number into the A6/A7 command buffers (`sprintf("%06d", txNum)`).
+7. Begin normal receive loop.
+
+> **Note:** The GD32 may send a `0x03 StatusUpdate` before the first `0x02 InfoSync`
+> arrives. This must be handled gracefully even during init (the ESPHome component
+> processes it in the receive loop regardless).
 
 ---
 
@@ -587,13 +734,19 @@ the GD32 will reject obviously invalid timestamps.
 
 ## 11. GPIO Reference (AC011K Board)
 
-| Function | GPIO | Logic |
-|----------|------|-------|
-| Green LED | GPIO 25 | Active LOW |
-| Red LED | GPIO 33 | Active LOW |
-| Button SW3 | GPIO 32 | Active LOW (pull-up) |
-| UART RX (from GD32) | GPIO 26 | — |
-| UART TX (to GD32) | GPIO 27 | — |
+| Function | GPIO | Logic | Notes |
+|----------|------|-------|-------|
+| Green LED | GPIO 25 | Active LOW | Confirmed from original firmware strings |
+| Red LED | GPIO 33 | Active LOW | Confirmed from original firmware strings |
+| Button SW3 | GPIO 32 | Active LOW (pull-up) | Confirmed |
+| UART RX (from GD32) | **TBD** | — | GPIO 26/27 reserved for RMII Ethernet — actual pins under investigation |
+| UART TX (to GD32) | **TBD** | — | see above |
+
+> **UART pin conflict:** The hardware wiring uses GPIO 26 (RX) and GPIO 27 (TX) for the
+> GD32 serial bus. However, both pins are hardcoded by ESP-IDF as RMII Ethernet signals
+> (`EMAC_RXD1` and `EMAC_RX_CRS_DV`). The original firmware uses a custom Ethernet driver
+> that avoids this conflict; ESPHome's standard RMII Ethernet driver cannot. The correct
+> UART pins for use with ESPHome's Ethernet stack have not yet been determined.
 
 ---
 
@@ -624,3 +777,17 @@ the GD32 will reject obviously invalid timestamps.
 7. **ESP32 TX buffer:** The original firmware uses a 1024-byte `PrivCommTxBuffer` with
    the fixed header `FA 03 00 00` pre-loaded at `[0..3]`. The SEQ is always copied from
    the most recent received frame's SEQ into `TxBuffer[5]` before building a reply.
+
+8. **0x03 before 0x02 during boot:** The GD32 may send a `0x03 StatusUpdate` before it
+   sends the first `0x02 InfoSync`. The original firmware logs this as
+   `"gun_id:0 status ptr is error!"` when the status handler is called before init is
+   complete. The ESPHome component handles `0x03` unconditionally in the receive loop
+   which avoids this issue.
+
+9. **0x02 repeats until acknowledged:** The GD32 re-sends `0x02 InfoSync` approximately
+   every 10 s during boot. It sends the same SEQ number each time until the ESP32
+   acknowledges (or starts normal operation). All occurrences must receive a `0xA2` reply.
+
+10. **0x0A response type byte:** Responses to `0xAA` GET commands use type byte `0x10` in the
+    payload (same value as the request). ACK responses to SET commands use `0x14`. This allows
+    distinguishing a data response from a confirmation.
