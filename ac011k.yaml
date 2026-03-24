@@ -27,6 +27,10 @@ esp32:
   framework:
     type: esp-idf
 
+psram:
+  mode: quad   # ESP32-D0WD: quad-SPI PSRAM
+  speed: 40MHz
+
 external_components:
   - source:
       type: local
@@ -51,6 +55,9 @@ wifi:
     password: !secret fallback_ap_password
 
 captive_portal:
+
+web_server:
+  port: 80
 
 #ethernet:
 #  type: IP101          # Firmware confirmed: esp_eth_phy_new_ip101 (was LAN8720)
@@ -111,6 +118,15 @@ sensor:
       # 1=Available  2=Preparing(plugged)  3=Charging  4=Suspended by charger
       # 5=Suspended by EV  6=Finishing  7=Reserved  8=Unavailable  9=Fault
 
+# ── EVSE state text sensor ─────────────────────────────────────────────────────
+text_sensor:
+  - platform: ac011k
+    ac011k_id: ac011k_hub
+    evse_state:
+      name: "Charger EVSE State"
+      entity_category: diagnostic
+      icon: mdi:ev-station
+
 # ── State binary sensors ───────────────────────────────────────────────────────
 binary_sensor:
   - platform: ac011k
@@ -170,6 +186,9 @@ select:
     optimistic: true
     restore_value: true
     set_action:
+      # x is the newly selected option; state is not yet committed when set_action runs,
+      # so publish it first so current_option() is correct when the script reads it.
+      - lambda: 'id(phase_mode_select).publish_state(x);'
       - script.execute: apply_charging_settings
 
 number:
@@ -186,6 +205,7 @@ number:
     optimistic: true
     restore_value: true
     set_action:
+      - lambda: 'id(target_power).publish_state(x);'
       - script.execute: apply_charging_settings
 
 button:
@@ -217,7 +237,10 @@ script:
     then:
       - lambda: |-
           float power = id(target_power).state;
-          std::string mode = id(phase_mode_select).state;
+          std::string mode = id(phase_mode_select).current_option();
+
+          ESP_LOGI("ac011k", "apply_charging_settings called: power=%.0fW mode=%s",
+                   power, mode.c_str());
 
           uint8_t phases;
           float amps_f;

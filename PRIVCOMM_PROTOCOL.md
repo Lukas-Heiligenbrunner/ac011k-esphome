@@ -12,9 +12,9 @@ AC011K wallbox hardware.
 
 | Parameter | Value |
 |-----------|-------|
-| Interface | UART (Serial2 on ESP32) |
-| RX pin (ESP32 input) | **TBD** — GPIO 26/27 conflict with RMII Ethernet; actual pins under investigation |
-| TX pin (ESP32 output) | **TBD** — see above |
+| Interface | UART1 on ESP32 |
+| RX pin (ESP32 input) | **GPIO 34** (input-only pin; confirmed by Capstone disassembly of ecactus_firmware_dump.bin) |
+| TX pin (ESP32 output) | **GPIO 32** (confirmed: `uart_set_pin(UART1, tx=32, rx=34)` at 0x4014633D) |
 | Baud rate | 115200 |
 | Frame format | 8N1 |
 | RX buffer (ESP32) | 1024 bytes |
@@ -194,9 +194,18 @@ Sent whenever EVSE status changes.
 
 | Offset | Content |
 |--------|---------|
-| 8 | Sub-status byte (purpose not fully determined) |
+| 8 | **GD32 internal state code** (see below) |
 | 9 | **EVSE status code** (see §6) |
 | 22..27 | Timestamp: year-2000, month, day, hour, min, sec |
+
+**GD32 internal state codes (buf[8]):**
+
+| Code | Meaning |
+|------|---------|
+| 0x50 | Waiting / cable plugged (EVSE 2 = Preparing) |
+| 0x80 | Idle / available (EVSE 1 = Available) |
+| 0x90 | Suspended / finishing (EVSE 5/6 = SuspendedEV/Finishing) |
+| 0xA0 | Charging active (EVSE 3 = Charging) |
 
 **ESP32 must reply with 0xA3** (`sendTime(0xA3, 0x10, 8, seq)`).
 
@@ -309,10 +318,16 @@ Sub-type at `buf[9]`:
 
 ### 4.10 CMD 0x0F — Schedule Request
 
-GD32 asks the ESP32 for the current charging schedule. Sent after receiving an 0xAD
-smart-charge command.
+GD32 asks the ESP32 for the current charging schedule. Sent repeatedly during init,
+before charging approval (0x07), and periodically during active sessions.
 
-**ESP32 must reply with 0xAF** (see §5.9).
+| Offset | Content |
+|--------|---------|
+| 8 | gun_id (0x00) |
+| 9..14 | UTC timestamp: year-2000, month, day, hour, min, sec |
+| 15..17 | Fixed bytes: 0x80 0x51 0x01 |
+
+**ESP32 must reply with 0xAF** (see §5.9) using the same SEQ number.
 
 ---
 
@@ -658,14 +673,17 @@ ESP32                                GD32
   │ ────► 0xA3 + UTC time ───────────►│
   │                                   │
   │ ────► 0xA6 StartChargingA6 ──────►│  (flag byte = 0x30)
-  │ ────► 0xAF ChargingLimit ─────────►│  (set current limit)
+  │ ────► 0xAF ChargingLimit ─────────►│  (set current limit; also reply to any pending 0x0F)
   │                                   │
   │ <──── 0x06 RemoteStart Ack ───────┤
+  │                                   │
+  │ <──── 0x0F ScheduleRequest ───────┤  (GD asks for schedule before approving)
+  │ ────► 0xAF ChargingLimit ─────────►│  (reply with current limit)
   │                                   │
   │ <──── 0x07 ChargingApproval ──────┤  (buf[72]=0x00 = start)
   │ ────► 0xA7 StartApprove ─────────►│
   │                                   │
-  │ <──── 0x03 StatusUpdate ──────────┤  (status=3 Charging)
+  │ <──── 0x03 StatusUpdate ──────────┤  (status=5 SuspendedEV briefly, then status=3 Charging)
   │ ────► 0xA3 + UTC time ───────────►│
   │                                   │
   │ <──── 0x08 MeterData ─────────────┤  (every ~10 s)
@@ -738,15 +756,14 @@ the GD32 will reject obviously invalid timestamps.
 |----------|------|-------|-------|
 | Green LED | GPIO 25 | Active LOW | Confirmed from original firmware strings |
 | Red LED | GPIO 33 | Active LOW | Confirmed from original firmware strings |
-| Button SW3 | GPIO 32 | Active LOW (pull-up) | Confirmed |
-| UART RX (from GD32) | **TBD** | — | GPIO 26/27 reserved for RMII Ethernet — actual pins under investigation |
-| UART TX (to GD32) | **TBD** | — | see above |
+| Button SW3 | **Unknown** | Active LOW (pull-up) | GPIO 32 is UART TX — button pin not yet traced |
+| UART RX (from GD32) | **GPIO 34** | — | Input-only pin; confirmed by Capstone disassembly |
+| UART TX (to GD32) | **GPIO 32** | — | Confirmed: `uart_set_pin(UART1, tx=32, rx=34)` at 0x4014633D |
 
-> **UART pin conflict:** The hardware wiring uses GPIO 26 (RX) and GPIO 27 (TX) for the
-> GD32 serial bus. However, both pins are hardcoded by ESP-IDF as RMII Ethernet signals
-> (`EMAC_RXD1` and `EMAC_RX_CRS_DV`). The original firmware uses a custom Ethernet driver
-> that avoids this conflict; ESPHome's standard RMII Ethernet driver cannot. The correct
-> UART pins for use with ESPHome's Ethernet stack have not yet been determined.
+> **GPIO 25 note:** GPIO 25 (Green LED) is also the RMII `EMAC_RXD0` signal. If Ethernet
+> is re-enabled, the green LED functionality will conflict with the Ethernet MAC. The
+> original firmware uses a custom Ethernet driver that avoids this conflict by not using
+> standard RMII pin assignments.
 
 ---
 

@@ -5,12 +5,12 @@
 //
 // Reference: software/src/modules/ac011k/ac011k.cpp in this repository.
 //
-// Wiring (fixed on AC011K board):
-//   Serial2 RX <- GPIO 26  (from GD32)
-//   Serial2 TX -> GPIO 27  (to GD32)
-//   Green LED   = GPIO 25  (active LOW)
-//   Red LED     = GPIO 33  (active LOW)
-//   Button SW3  = GPIO 32  (active LOW)
+// Wiring (confirmed from ecactus_firmware_dump.bin):
+//   UART1 RX <- GPIO 34  (from GD32, input-only pin)
+//   UART1 TX -> GPIO 32  (to GD32)
+//   Green LED  = GPIO 25  (active LOW)
+//   Red LED    = GPIO 33  (active LOW)
+//   Button SW3 = GPIO ?? (GPIO 32 is TX — button pin not yet traced)
 
 #pragma once
 
@@ -19,6 +19,7 @@
 #include "esphome/components/uart/uart.h"
 #include "esphome/components/sensor/sensor.h"
 #include "esphome/components/binary_sensor/binary_sensor.h"
+#include "esphome/components/text_sensor/text_sensor.h"
 
 #include <cstring>
 #include <ctime>
@@ -27,6 +28,161 @@ namespace esphome {
 namespace ac011k {
 
 static const char *const TAG = "ac011k";
+
+static inline uint16_t get_u16(const uint8_t *buf, int i) {
+    return (uint16_t)(buf[i] | ((uint16_t)buf[i + 1] << 8));
+}
+
+// Log up to 32 bytes of a frame as hex + a decoded one-liner at DEBUG level.
+// dir: "TX" or "RX"
+static void log_frame(const char *dir, const uint8_t *frame, size_t len) {
+    // Hex dump (max 64 bytes shown)
+    char hex[3 * 64 + 1];
+    size_t show = len < 64 ? len : 64;
+    for (size_t i = 0; i < show; i++)
+        snprintf(hex + 3 * i, 4, "%02X ", frame[i]);
+    if (show < len)
+        snprintf(hex + 3 * show, 4, "...");
+    else
+        hex[3 * show > 0 ? 3 * show - 1 : 0] = '\0';
+
+    uint8_t cmd = len > 4 ? frame[4] : 0;
+    uint8_t seq = len > 5 ? frame[5] : 0;
+    uint16_t plen = len > 7 ? (uint16_t)(frame[6] | ((uint16_t)frame[7] << 8)) : 0;
+
+    // One-liner decode
+    char desc[128] = "";
+    if (len >= 8) {
+        const uint8_t *d = frame + 8;  // payload bytes (after header)
+        switch (cmd) {
+            // ── GD32 → ESP32 ───────────────────────────────────────────────
+            case 0x02:
+                snprintf(desc, sizeof(desc), "InfoSync SN=%.16s HW=%.12s FW=%.8s",
+                         (const char *)d, (const char *)(d + 35), (const char *)(d + 83));
+                break;
+            case 0x03:
+                snprintf(desc, sizeof(desc), "StatusUpdate sub=0x%02X evse=%d", d[0], d[1]);
+                break;
+            case 0x04:
+                snprintf(desc, sizeof(desc), "Heartbeat evse=%d", d[0]);
+                break;
+            case 0x05:
+                snprintf(desc, sizeof(desc), "RFIDCard %02X:%02X:%02X:%02X:%02X:%02X:%02X:%02X",
+                         d[0],d[1],d[2],d[3],d[4],d[5],d[6],d[7]);
+                break;
+            case 0x06:
+                snprintf(desc, sizeof(desc), "RemoteStartAck flag=0x%02X (%s)",
+                         d[64], d[64] == 0x40 ? "stop-ack" : "start-ack");
+                break;
+            case 0x07:
+                snprintf(desc, sizeof(desc), "ChargingApproval buf[72]=0x%02X (%s)",
+                         d[64], d[64] == 0 ? "start?" : "stop?");
+                break;
+            case 0x08:
+                if (plen >= 70)
+                    snprintf(desc, sizeof(desc),
+                             "MeterData evse=%d P=%dW V=%d/%d/%dV I=%d/%d/%d A",
+                             d[69], (int)get_u16(frame, 96),
+                             (int)(get_u16(frame, 100)/10), (int)(get_u16(frame, 102)/10), (int)(get_u16(frame, 104)/10),
+                             (int)(get_u16(frame, 106)/10), (int)(get_u16(frame, 108)/10), (int)(get_u16(frame, 110)/10));
+                else
+                    snprintf(desc, sizeof(desc), "MeterData (short plen=%d)", plen);
+                break;
+            case 0x09:
+                snprintf(desc, sizeof(desc), "ChargingStopped reason=%d energy=%dWh",
+                         d[69], (int)get_u16(frame, 96));
+                break;
+            case 0x0A:
+                snprintf(desc, sizeof(desc), "CtrlAck sub=0x%02X type=0x%02X", d[1], d[0]);
+                break;
+            case 0x0C:
+                snprintf(desc, sizeof(desc), "ACCtrlAck sub=0x%02X val=%d", d[1],
+                         plen >= 4 ? (d[2] | (d[3] << 8)) : (plen >= 2 ? d[2] : 0));
+                break;
+            case 0x0D:
+                snprintf(desc, sizeof(desc), "LimitAck");
+                break;
+            case 0x0E:
+                snprintf(desc, sizeof(desc), "ClockAlignedExtData");
+                break;
+            case 0x0F:
+                snprintf(desc, sizeof(desc), "ScheduleRequest gun=%d", plen > 0 ? d[0] : 0);
+                break;
+            // ── ESP32 → GD32 ───────────────────────────────────────────────
+            case 0xA2:
+                snprintf(desc, sizeof(desc), "InfoSyncAck");
+                break;
+            case 0xA3:
+                snprintf(desc, sizeof(desc), "StatusAck time=20%02d-%02d-%02d %02d:%02d:%02d",
+                         d[1],d[2],d[3],d[4],d[5],d[6]);
+                break;
+            case 0xA4:
+                snprintf(desc, sizeof(desc), "HeartbeatAck time=20%02d-%02d-%02d %02d:%02d:%02d",
+                         d[1],d[2],d[3],d[4],d[5],d[6]);
+                break;
+            case 0xA5:
+                snprintf(desc, sizeof(desc), "CardAuthAck result=0x%02X", d[32]);
+                break;
+            case 0xA6:
+                snprintf(desc, sizeof(desc), "RemoteTransaction flag=0x%02X (%s)",
+                         d[65], d[65] == 0x30 ? "START" : (d[65] == 0x40 ? "STOP" : "?"));
+                break;
+            case 0xA7:
+                snprintf(desc, sizeof(desc), "TransactionApprove flag=0x%02X (%s) txn=%.6s",
+                         d[33], d[33] == 0x10 ? "STOP" : "START", (const char *)d + 1);
+                break;
+            case 0xA8:
+                snprintf(desc, sizeof(desc), "MeterAck time=20%02d-%02d-%02d %02d:%02d:%02d",
+                         d[1],d[2],d[3],d[4],d[5],d[6]);
+                break;
+            case 0xA9:
+                snprintf(desc, sizeof(desc), "TransactionAck");
+                break;
+            case 0xAA:
+                if (plen >= 2) {
+                    uint8_t sub = d[1];
+                    uint16_t dlen = plen >= 4 ? (uint16_t)(d[2] | ((uint16_t)d[3] << 8)) : 0;
+                    const char *type_s = (d[0] == 0x18) ? "SET" : "GET";
+                    if (sub == 0x12)
+                        snprintf(desc, sizeof(desc), "CtrlCmd %s SetReset reason=%d", type_s, dlen > 0 ? d[4] : 0);
+                    else if (sub == 0x02 && d[0] == 0x18 && dlen == 6)
+                        snprintf(desc, sizeof(desc), "CtrlCmd SET SetRTC 20%02d-%02d-%02d %02d:%02d:%02d",
+                                 d[4],d[5],d[6],d[7],d[8],d[9]);
+                    else if (sub == 0x52)
+                        snprintf(desc, sizeof(desc), "CtrlCmd SET SetPhase phases=%d", dlen > 0 ? d[4] : 0);
+                    else if (sub == 0x3E)
+                        snprintf(desc, sizeof(desc), "CtrlCmd %s ClkAlignedInt=%ds", type_s,
+                                 dlen >= 4 ? (int)(d[4]|(d[5]<<8)|(d[6]<<16)|(d[7]<<24)) : 0);
+                    else if (sub == 0x08)
+                        snprintf(desc, sizeof(desc), "CtrlCmd %s HBTimeout=%ds", type_s,
+                                 dlen >= 2 ? (int)(d[4]|(d[5]<<8)) : 0);
+                    else
+                        snprintf(desc, sizeof(desc), "CtrlCmd %s sub=0x%02X dlen=%d", type_s, sub, dlen);
+                }
+                break;
+            case 0xAC:
+                if (plen >= 2) {
+                    uint8_t sub = d[1];
+                    uint16_t dlen = plen >= 4 ? (uint16_t)(d[2] | ((uint16_t)d[3] << 8)) : 0;
+                    int val = dlen == 1 ? d[4] : (dlen >= 2 ? (int)(d[4]|(d[5]<<8)) : -1);
+                    const char *names[] = {"","","","","","","","","MinCurr","S2OpenStop","S2OpenLock","RemoteStart","OfflineStop","OfflineEnergy"};
+                    const char *name = sub < 14 ? names[sub] : "?";
+                    snprintf(desc, sizeof(desc), "ACCtrl sub=0x%02X (%s) val=%d", sub, name, val);
+                }
+                break;
+            case 0xAF:
+                // payload[17] = amps; frame[8..] = payload[1..], so amps at d[16]
+                snprintf(desc, sizeof(desc), "SmartCurrCtl limit=%dA", plen >= 17 ? d[16] : 0);
+                break;
+            default:
+                snprintf(desc, sizeof(desc), "unknown");
+                break;
+        }
+    }
+
+    ESP_LOGD(TAG, "%s cmd=0x%02X seq=%d len=%d  %s", dir, cmd, seq, plen, desc);
+    ESP_LOGV(TAG, "%s raw: %s", dir, hex);
+}
 
 // ── CRC-16/ARC: init=0x0000, poly=0xA001 (reflected 0x8005)
 //    Matches crc16_modbus() in ac011k.cpp. Note: init=0x0000, NOT 0xFFFF.
@@ -38,10 +194,6 @@ static uint16_t privcomm_crc16(const uint8_t *data, size_t len) {
             crc = (crc & 1) ? ((crc >> 1) ^ 0xA001u) : (crc >> 1);
     }
     return crc;
-}
-
-static inline uint16_t get_u16(const uint8_t *buf, int i) {
-    return (uint16_t)(buf[i] | ((uint16_t)buf[i + 1] << 8));
 }
 
 // ── Frame parser states ───────────────────────────────────────────────────────
@@ -116,7 +268,8 @@ public:
     void set_current_l3_sensor(sensor::Sensor *s)     { s_current_l3_ = s; }
     void set_energy_session_sensor(sensor::Sensor *s) { s_energy_sess_ = s; }
     void set_energy_total_sensor(sensor::Sensor *s)   { s_energy_total_ = s; }
-    void set_evse_status_sensor(sensor::Sensor *s)    { s_evse_status_ = s; }
+    void set_evse_status_sensor(sensor::Sensor *s)          { s_evse_status_ = s; }
+    void set_evse_state_sensor(text_sensor::TextSensor *s)  { ts_evse_state_ = s; }
 
     void set_plugged_binary_sensor(binary_sensor::BinarySensor *s)  { bs_plugged_ = s; }
     void set_charging_binary_sensor(binary_sensor::BinarySensor *s) { bs_charging_ = s; }
@@ -137,13 +290,14 @@ public:
     }
 
     // Set the current limit in amperes (6–16 A for AC011K hardware).
-    // Takes effect immediately during charging; also applies at next session start.
+    // Updates the stored limit; the GD32 picks it up on its next 0x0F ScheduleRequest
+    // (sent every ~30 s during active charging, and before every 0x07 ChargingApproval).
+    // Do NOT send 0xAF here proactively — the GD32 ignores unsolicited 0xAF frames.
     void set_current_limit(uint8_t amps) {
         if (amps < 6)  amps = 6;
         if (amps > 16) amps = 16;
         current_limit_a_ = amps;
-        ESP_LOGI(TAG, "set_current_limit(%d A)", amps);
-        send_charging_limit(amps);
+        ESP_LOGI(TAG, "set_current_limit(%d A) — will apply on next 0x0F schedule request", amps);
     }
 
     uint8_t get_current_limit() const { return current_limit_a_; }
@@ -268,6 +422,7 @@ public:
 
         if (frame_ready_) {
             frame_ready_ = false;
+            log_frame("RX", rx_buf_, rx_len_ + 10);
             handle_frame(rx_cmd_, rx_seq_, rx_buf_, rx_len_);
         }
     }
@@ -285,7 +440,8 @@ private:
     sensor::Sensor *s_current_l3_  = nullptr;
     sensor::Sensor *s_energy_sess_ = nullptr;
     sensor::Sensor *s_energy_total_= nullptr;
-    sensor::Sensor *s_evse_status_ = nullptr;
+    sensor::Sensor *s_evse_status_             = nullptr;
+    text_sensor::TextSensor *ts_evse_state_   = nullptr;
     binary_sensor::BinarySensor *bs_plugged_  = nullptr;
     binary_sensor::BinarySensor *bs_charging_ = nullptr;
 
@@ -383,6 +539,10 @@ private:
                 ESP_LOGD(TAG, "Charging limit ack");
                 break;
 
+            case 0x0E:  // ClockAlignedExtData — extended meter/session report (no reply required)
+                ESP_LOGD(TAG, "ClockAlignedExtData (extended meter block)");
+                break;
+
             case 0x0F:  // GD requests current charging schedule — reply with our limit
                 ESP_LOGD(TAG, "GD requests charging schedule, replying %d A", current_limit_a_);
                 send_charging_limit(current_limit_a_);
@@ -401,6 +561,12 @@ private:
     void update_status(uint8_t status) {
         if (s_evse_status_ != nullptr)
             s_evse_status_->publish_state(status);
+        if (ts_evse_state_ != nullptr) {
+            const char *names[] = {"", "Available", "Preparing", "Charging",
+                                   "Suspended by Charger", "Suspended by EV",
+                                   "Finishing", "Reserved", "Unavailable", "Fault"};
+            ts_evse_state_->publish_state(status < 10 ? names[status] : "Unknown");
+        }
         if (bs_plugged_ != nullptr)
             bs_plugged_->publish_state(status >= 2 && status <= 6);
         if (bs_charging_ != nullptr)
@@ -495,6 +661,7 @@ private:
         uint16_t crc = privcomm_crc16(frame, size + 7);
         frame[size + 7] = crc & 0xFF;
         frame[size + 8] = crc >> 8;
+        log_frame("TX", frame, size + 9);
         write_array(frame, size + 9);
     }
 

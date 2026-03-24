@@ -5,7 +5,7 @@ from esphome.components import uart
 
 CODEOWNERS = ["@warp-more-hardware"]
 DEPENDENCIES = ["uart"]
-AUTO_LOAD = ["sensor", "binary_sensor"]
+AUTO_LOAD = ["sensor", "binary_sensor", "text_sensor"]
 
 CONF_AC011K_ID = "ac011k_id"
 
