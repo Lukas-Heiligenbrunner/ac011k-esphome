@@ -148,8 +148,11 @@ binary_sensor:
       name: "Charger Charging Active"
       id: ev_charging
   - platform: gpio
-    pin: GPIO36
-    name: "Living Room Window"
+    pin:
+      number: GPIO36
+      inverted: true
+    name: "PCB Button"
+
   # NOTE: GPIO32 is UART1 TX (confirmed from firmware), so it cannot be used as a button.
   # GPIO34 is UART1 RX. The physical button GPIO is unknown — needs hardware tracing.
   # - platform: gpio
