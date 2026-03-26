@@ -277,10 +277,12 @@ public:
     // ── Public control API (call from YAML lambdas via id(ac011k_hub)) ────────
 
     // Start a charging session. Cable must be plugged in (EVSE status 2).
+    // Only send A6 — do NOT send AF here. The GD32 will send a 0x0F ScheduleRequest
+    // before sending 0x07 ChargingApproval, and we respond to that with AF.
+    // (Warp firmware reference: bs_evse_start_charging(), FW >= 1.1.258 path)
     void start_charging() {
         ESP_LOGI(TAG, "start_charging()");
         send_frame(kStartChargingA6, sizeof(kStartChargingA6), seq_++);
-        send_charging_limit(current_limit_a_);
     }
 
     // Stop an ongoing charging session.
@@ -290,14 +292,14 @@ public:
     }
 
     // Set the current limit in amperes (6–16 A for AC011K hardware).
-    // Updates the stored limit; the GD32 picks it up on its next 0x0F ScheduleRequest
-    // (sent every ~30 s during active charging, and before every 0x07 ChargingApproval).
-    // Do NOT send 0xAF here proactively — the GD32 ignores unsolicited 0xAF frames.
+    // Sends 0xAF proactively with own seq (warp firmware: bs_evse_set_max_charging_current).
+    // The GD32 also picks up the limit via the 0x0F ScheduleRequest handler below.
     void set_current_limit(uint8_t amps) {
         if (amps < 6)  amps = 6;
         if (amps > 16) amps = 16;
         current_limit_a_ = amps;
-        ESP_LOGI(TAG, "set_current_limit(%d A) — will apply on next 0x0F schedule request", amps);
+        ESP_LOGI(TAG, "set_current_limit(%d A)", amps);
+        send_charging_limit(amps, seq_++);
     }
 
     uint8_t get_current_limit() const { return current_limit_a_; }
@@ -543,9 +545,11 @@ private:
                 ESP_LOGD(TAG, "ClockAlignedExtData (extended meter block)");
                 break;
 
-            case 0x0F:  // GD requests current charging schedule — reply with our limit
+            case 0x0F:  // GD requests current charging schedule — reply with received seq
+                // Warp firmware: sendChargingLimit1(allowed_charging_current, seq)
+                // Must mirror back the received seq, NOT use own seq++
                 ESP_LOGD(TAG, "GD requests charging schedule, replying %d A", current_limit_a_);
-                send_charging_limit(current_limit_a_);
+                send_charging_limit(current_limit_a_, seq);
                 break;
 
             default:
@@ -602,8 +606,8 @@ private:
     }
 
     // ── ChargingLimit via cmd 0xAF (firmware >= 1.1.258, all current hardware) ─
-    // 286-byte payload: cmd + pad + 6-byte UTC time + fixed header + amps + zeros
-    void send_charging_limit(uint8_t amps) {
+    // seq: use received seq for 0x0F replies; use seq_++ for proactive sends.
+    void send_charging_limit(uint8_t amps, uint8_t seq) {
         uint8_t pl[286] = {};
         pl[0]  = 0xAF;
         pl[1]  = 0x00;
@@ -614,7 +618,7 @@ private:
         pl[11] = 0x00;
         pl[12] = 0x01;
         pl[17] = amps;
-        send_frame(pl, sizeof(pl), seq_++);
+        send_frame(pl, sizeof(pl), seq);
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
