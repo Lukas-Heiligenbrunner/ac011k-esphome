@@ -125,11 +125,11 @@ static void log_frame(const char *dir, const uint8_t *frame, size_t len) {
                 break;
             case 0xA6:
                 snprintf(desc, sizeof(desc), "RemoteTransaction flag=0x%02X (%s)",
-                         d[65], d[65] == 0x30 ? "START" : (d[65] == 0x40 ? "STOP" : "?"));
+                         d[64], d[64] == 0x30 ? "START" : (d[64] == 0x40 ? "STOP" : "?"));
                 break;
             case 0xA7:
                 snprintf(desc, sizeof(desc), "TransactionApprove flag=0x%02X (%s) txn=%.6s",
-                         d[33], d[33] == 0x10 ? "STOP" : "START", (const char *)d + 1);
+                         d[32], d[32] == 0x10 ? "STOP" : "START", (const char *)d);
                 break;
             case 0xA8:
                 snprintf(desc, sizeof(desc), "MeterAck time=20%02d-%02d-%02d %02d:%02d:%02d",
@@ -230,13 +230,14 @@ static const uint8_t kStartChargingA6[74] = {
 };
 
 // StopChargingA6 template: bytes 33-38 = transaction number (ASCII), byte 65 = 0x40 stop flag
+// Flag must be at template[65] so that d[64]=frame[72] == 0x40 (same offset as start flag 0x30).
 static const uint8_t kStopChargingA6Template[75] = {
     0xA6,
     0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    '0','0','0','0','0','0',  // bytes 33-38: transaction number (patched in constructor)
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0x40,  // stop flag
-    0,0,0,0,0,0,0,0
+    '0','0','0','0','0','0',  // bytes 33-38: transaction number (patched in setup())
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0x40,  // stop flag at template[65] → d[64]=frame[72]
+    0,0,0,0,0,0,0,0,0
 };
 
 // TransactionAck: sent in response to charging-stop notification (cmd 0x09)
