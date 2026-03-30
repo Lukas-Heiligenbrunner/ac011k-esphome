@@ -105,6 +105,14 @@ SENSORS = {
             state_class=STATE_CLASS_MEASUREMENT,
         ),
     ),
+    "phases_connected": (
+        "set_phases_sensor",
+        sensor.sensor_schema(
+            accuracy_decimals=0,
+            state_class=STATE_CLASS_MEASUREMENT,
+            icon="mdi:sine-wave",
+        ),
+    ),
 }
 
 CONFIG_SCHEMA = cv.Schema(

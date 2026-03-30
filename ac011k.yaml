@@ -6,17 +6,13 @@
 #     --before default_reset --after hard_reset write_flash 0x0 ac011k.bin
 # Subsequent updates: esphome run ac011k.yaml  (OTA)
 #
-# Power control logic:
-#   - "Target Power" (W) is the primary control: it drives both phase selection
-#     and per-phase current automatically.
-#   - Phase Mode "Auto": ≤ 3680 W → 1-phase, > 3680 W → 3-phase.
-#   - Phase Mode "1-Phase" / "3-Phase": forced, current calculated accordingly.
+# Charging control:
+#   - "Target Current" (A) is the primary control, sent directly to the GD32 via 0xAF.
+#   - Charger always runs 3-phase (phase switching via PrivComm cmd 0x52 is
+#     not functional on this hardware — GD32 ignores it).
 #   - Auto-Start: when enabled the charger starts automatically on plug-in.
 #
-# Phase / power limits (230 V grid):
-#   1-phase:  6 A × 230 V =  1380 W  ...  16 A × 230 V =  3680 W
-#   3-phase:  6 A × 690 V =  4140 W  ...  16 A × 690 V = 11040 W
-#   (3-phase minimum requires > 3680 W target in Auto mode)
+# Current limits: 6 A (min) … 16 A (max) per phase
 
 esphome:
   name: ac011k-charger
@@ -119,6 +115,11 @@ sensor:
       entity_category: diagnostic
       # 1=Available  2=Preparing(plugged)  3=Charging  4=Suspended by charger
       # 5=Suspended by EV  6=Finishing  7=Reserved  8=Unavailable  9=Fault
+    phases_connected:
+      name: "Charger Active Phases"
+      entity_category: diagnostic
+      icon: mdi:sine-wave
+      # Phases with voltage > 70 V in 0x08 meter data. Updates during charging only.
 
 # ── EVSE state text sensor ─────────────────────────────────────────────────────
 text_sensor:
@@ -177,40 +178,21 @@ switch:
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
 
-select:
-  # Phase mode: Auto switches at the 3680 W boundary (16 A × 1φ × 230 V).
-  - platform: template
-    name: "Phase Mode"
-    id: phase_mode_select
-    icon: mdi:sine-wave
-    options:
-      - "Auto"
-      - "1-Phase"
-      - "3-Phase"
-    initial_option: "Auto"
-    optimistic: true
-    restore_value: true
-    set_action:
-      # x is the newly selected option; state is not yet committed when set_action runs,
-      # so publish it first so current_option() is correct when the script reads it.
-      - lambda: 'id(phase_mode_select).publish_state(x);'
-      - script.execute: apply_charging_settings
 
 number:
-  # Target charging power in watts. Drives phase selection + per-phase current.
   - platform: template
-    name: "Target Charging Power"
-    id: target_power
-    unit_of_measurement: "W"
-    icon: mdi:flash
-    min_value: 1380    # 6 A × 230 V (1-phase minimum)
-    max_value: 11040   # 16 A × 690 V (3-phase maximum)
-    step: 100
-    initial_value: 3680  # 16 A × 1-phase — safe default for all setups
+    name: "Target Charging Current"
+    id: target_current
+    unit_of_measurement: "A"
+    icon: mdi:current-ac
+    min_value: 6
+    max_value: 16
+    step: 1
+    initial_value: 16
     optimistic: true
     restore_value: true
     set_action:
-      - lambda: 'id(target_power).publish_state(x);'
+      - lambda: 'id(target_current).publish_state(x);'
       - script.execute: apply_charging_settings
 
 button:
@@ -218,57 +200,28 @@ button:
     name: "Start Charging"
     icon: mdi:play-circle
     on_press:
-      - script.execute: apply_charging_settings
-      - lambda: 'id(ac011k_hub).start_charging();'
+      - if:
+          condition:
+            binary_sensor.is_off: ev_charging
+          then:
+            - script.execute: apply_charging_settings
+            - lambda: 'id(ac011k_hub).start_charging();'
 
   - platform: template
     name: "Stop Charging"
     icon: mdi:stop-circle
     on_press:
-      - lambda: 'id(ac011k_hub).stop_charging();'
+      - if:
+          condition:
+            binary_sensor.is_on: ev_charging
+          then:
+            - lambda: 'id(ac011k_hub).stop_charging();'
 
 # ── Core logic script ──────────────────────────────────────────────────────────
-# Calculates phase count and per-phase amperes from target_power + phase_mode_select,
-# then pushes both to the GD32 over PrivComm.
-#
-# Auto-mode boundary: 3680 W = 16 A × 1φ × 230 V
-#   ≤ 3680 W → 1-phase,  amps = power / 230        (clamped 6–16 A)
-#   > 3680 W → 3-phase,  amps = power / (3 × 230)  (clamped 6–16 A)
-#
-# Note: switching phases during an active session is supported by the GD32 firmware
-# (cmdAACtrlSetChgphase / AA 18 52). The GD32 handles the hardware transition.
 script:
   - id: apply_charging_settings
     then:
       - lambda: |-
-          float power = id(target_power).state;
-          std::string mode = id(phase_mode_select).current_option();
-
-          ESP_LOGI("ac011k", "apply_charging_settings called: power=%.0fW mode=%s",
-                   power, mode.c_str());
-
-          uint8_t phases;
-          float amps_f;
-
-          if (mode == "1-Phase") {
-              phases  = 1;
-              amps_f  = power / 230.0f;
-          } else if (mode == "3-Phase") {
-              phases  = 3;
-              amps_f  = power / (3.0f * 230.0f);
-          } else {
-              // Auto: use 1-phase up to the 16 A limit, then switch to 3-phase
-              if (power <= 3680.0f) {
-                  phases = 1;
-                  amps_f = power / 230.0f;
-              } else {
-                  phases = 3;
-                  amps_f = power / (3.0f * 230.0f);
-              }
-          }
-
-          uint8_t amps = (uint8_t) std::max(6.0f, std::min(16.0f, amps_f));
-          ESP_LOGI("ac011k", "apply: %.0f W  mode=%s  -> %d-phase @ %d A",
-                   power, mode.c_str(), phases, amps);
-          id(ac011k_hub).set_phases(phases);
+          uint8_t amps = (uint8_t) id(target_current).state;
+          ESP_LOGI("ac011k", "apply: %d A", amps);
           id(ac011k_hub).set_current_limit(amps);

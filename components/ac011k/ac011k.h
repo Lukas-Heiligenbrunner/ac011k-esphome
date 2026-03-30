@@ -271,6 +271,7 @@ public:
     void set_energy_total_sensor(sensor::Sensor *s)   { s_energy_total_ = s; }
     void set_evse_status_sensor(sensor::Sensor *s)          { s_evse_status_ = s; }
     void set_evse_state_sensor(text_sensor::TextSensor *s)  { ts_evse_state_ = s; }
+    void set_phases_sensor(sensor::Sensor *s)               { s_phases_ = s; }
 
     void set_plugged_binary_sensor(binary_sensor::BinarySensor *s)  { bs_plugged_ = s; }
     void set_charging_binary_sensor(binary_sensor::BinarySensor *s) { bs_charging_ = s; }
@@ -306,13 +307,16 @@ public:
     uint8_t get_current_limit() const { return current_limit_a_; }
 
     // Switch between 1-phase and 3-phase charging (cmdAACtrlSetChgphase, AA 18 52).
-    // phases must be 1 or 3. Takes effect immediately.
+    // NOTE: Phase switching does NOT work reliably. The GD32 seems to accept the
+    // command (0x0A ack received) but then ignores it — the charger always operates
+    // in 3-phase mode regardless. Kept here for future investigation.
+    // DO NOT call this function from normal charging control paths.
     void set_phases(uint8_t phases) {
         if (phases != 1 && phases != 3) return;
         phases_ = phases;
         uint8_t cmd[6] = {0xAA, 0x18, 0x52, 0x01, 0x00, phases};
         send_frame(cmd, sizeof(cmd), seq_++);
-        ESP_LOGI(TAG, "set_phases(%d)", phases);
+        ESP_LOGI(TAG, "set_phases(%d) [WARNING: not functional on this hardware]", phases);
     }
 
     uint8_t get_phases() const { return phases_; }
@@ -444,6 +448,7 @@ private:
     sensor::Sensor *s_energy_sess_ = nullptr;
     sensor::Sensor *s_energy_total_= nullptr;
     sensor::Sensor *s_evse_status_             = nullptr;
+    sensor::Sensor *s_phases_                 = nullptr;
     text_sensor::TextSensor *ts_evse_state_   = nullptr;
     binary_sensor::BinarySensor *bs_plugged_  = nullptr;
     binary_sensor::BinarySensor *bs_charging_ = nullptr;
@@ -604,6 +609,17 @@ private:
         if (s_current_l3_  != nullptr) s_current_l3_  ->publish_state(get_u16(buf, 110) / 10.0f);
         if (s_energy_sess_ != nullptr) s_energy_sess_ ->publish_state(get_u16(buf, 84)  / 1000.0f);
         if (s_energy_total_!= nullptr) s_energy_total_->publish_state(get_u16(buf, 88)  / 1000.0f);
+        // Count active phases from voltages. Only updates during active charging.
+        {
+            uint8_t p = 0;
+            if (get_u16(buf, 100) > 700)  p++;  // L1
+            if (get_u16(buf, 102) > 2100) p++;  // L2
+            if (get_u16(buf, 104) > 2100) p++;  // L3
+            if (p > 0) {
+                phases_ = p;
+                if (s_phases_ != nullptr) s_phases_->publish_state(p);
+            }
+        }
     }
 
     // ── ChargingLimit via cmd 0xAF (firmware >= 1.1.258, all current hardware) ─
