@@ -17,6 +17,10 @@
 esphome:
   name: ac011k-charger
   friendly_name: "EN+ AC011K EV Charger"
+  name_add_mac_suffix: true
+  project:
+    name: esphome.ac011k-charger
+    version: "1.0"
 
 esp32:
   board: esp32dev
@@ -224,4 +228,5 @@ script:
       - lambda: |-
           uint8_t amps = (uint8_t) id(target_current).state;
           ESP_LOGI("ac011k", "apply: %d A", amps);
+          id(ac011k_hub).set_phases(3);
           id(ac011k_hub).set_current_limit(amps);
