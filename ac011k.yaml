@@ -91,6 +91,15 @@ ac011k:
   id: ac011k_hub
   uart_id: privcomm_uart
 
+# ── Globals ────────────────────────────────────────────────────────────────────
+globals:
+  - id: auto_start_ticks   # counts 10s intervals with enough excess while not charging
+    type: int
+    initial_value: '0'
+  - id: auto_stop_ticks    # counts 10s intervals with insufficient excess while charging
+    type: int
+    initial_value: '0'
+
 # ── Meter sensors ──────────────────────────────────────────────────────────────
 sensor:
   - platform: ac011k
@@ -125,6 +134,28 @@ sensor:
       icon: mdi:sine-wave
       # Phases with voltage > 70 V in 0x08 meter data. Updates during charging only.
 
+  # ── Home Assistant sensors ───────────────────────────────────────────────────
+  - platform: homeassistant
+    id: grid_power
+    entity_id: sensor.shellypro3em_8813bfda0cc8_total_active_power
+    name: "Grid Power"
+    unit_of_measurement: "W"
+    icon: mdi:transmission-tower
+    # Positive = importing from grid, negative = exporting (excess solar)
+
+  - platform: template
+    name: "Solar Excess Power"
+    id: solar_excess_power
+    unit_of_measurement: "W"
+    icon: mdi:solar-power-variant
+    accuracy_decimals: 0
+    update_interval: 10s
+    lambda: |-
+      if (isnan(id(grid_power).state)) return NAN;
+      float c = isnan(id(charger_power).state) ? 0.0f : id(charger_power).state;
+      // available = what the charger can use without importing, minus 500W safety buffer
+      return c - id(grid_power).state - 500.0f;
+
 # ── EVSE state text sensor ─────────────────────────────────────────────────────
 text_sensor:
   - platform: ac011k
@@ -142,15 +173,26 @@ binary_sensor:
       name: "Charger Cable Plugged"
       id: ev_plugged
       on_press:
-        # Auto-start: when cable is inserted and auto-start is enabled, start charging.
-        # Small delay gives GD32 time to settle in "Preparing" state.
+        # Auto-start: when cable is inserted and auto-start is enabled AND solar auto mode
+        # is off, start charging immediately at target_current.
+        # In solar auto mode the interval handles start/stop instead.
         - if:
             condition:
-              switch.is_on: auto_start_switch
+              and:
+                - switch.is_on: auto_start_switch
+                - switch.is_off: solar_auto_mode
             then:
               - delay: 1500ms
               - script.execute: apply_charging_settings
               - lambda: 'id(ac011k_hub).start_charging();'
+        - if:
+            condition:
+              switch.is_on: solar_auto_mode
+            then:
+              # Reset hysteresis counters so the 30s window starts fresh on plug-in
+              - lambda: |-
+                  id(auto_start_ticks) = 0;
+                  id(auto_stop_ticks)  = 0;
     charging:
       name: "Charger Charging Active"
       id: ev_charging
@@ -174,13 +216,34 @@ binary_sensor:
 # ── Controls ───────────────────────────────────────────────────────────────────
 
 switch:
-  # Toggle: automatically start charging when cable is plugged in.
+  # Toggle: automatically start charging when cable is plugged in (manual mode only).
   - platform: template
     name: "Auto-Start Charging"
     id: auto_start_switch
     icon: mdi:ev-plug-type2
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
+
+  # Toggle: solar excess auto mode. Overrides manual start/stop and adjusts current
+  # to match available excess power (Shelly 3EM), with a 500 W safety buffer.
+  - platform: template
+    name: "Solar Auto Charging"
+    id: solar_auto_mode
+    icon: mdi:solar-power
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      # Reset hysteresis counters when mode is enabled
+      - lambda: |-
+          id(auto_start_ticks) = 0;
+          id(auto_stop_ticks)  = 0;
+    turn_off_action:
+      # Stop charging when leaving auto mode so the user decides manually
+      - if:
+          condition:
+            binary_sensor.is_on: ev_charging
+          then:
+            - lambda: 'id(ac011k_hub).stop_charging();'
 
 
 number:
@@ -220,6 +283,69 @@ button:
             binary_sensor.is_on: ev_charging
           then:
             - lambda: 'id(ac011k_hub).stop_charging();'
+
+# ── Solar auto-charge interval ─────────────────────────────────────────────────
+interval:
+  - interval: 10s
+    then:
+      - lambda: |-
+          if (!id(solar_auto_mode).state) return;
+          if (isnan(id(grid_power).state))  return;  // no HA connection yet
+
+          const float buffer_w = 500.0f;
+          const float v_total  = 230.0f * 3.0f;      // 3-phase at 230 V/phase
+          const int   min_a    = 6;
+          const int   max_a    = 16;
+          // 3 ticks × 10 s = 30 s hysteresis
+          const int   hyst     = 3;
+
+          float c = isnan(id(charger_power).state) ? 0.0f : id(charger_power).state;
+          // available = solar surplus available to the charger, after buffer
+          float available = c - id(grid_power).state - buffer_w;
+          int target_a = (int)(available / v_total);
+          if (target_a < min_a) target_a = min_a;
+          if (target_a > max_a) target_a = max_a;
+
+          bool enough   = available >= (float)min_a * v_total;
+          bool charging = id(ev_charging).state;
+          bool plugged  = id(ev_plugged).state;
+
+          if (!plugged) {
+            id(auto_start_ticks) = 0;
+            id(auto_stop_ticks)  = 0;
+            return;
+          }
+
+          if (!charging && enough) {
+            id(auto_stop_ticks)  = 0;
+            id(auto_start_ticks) = id(auto_start_ticks) + 1;
+            ESP_LOGI("solar", "start in %ds  available=%.0fW target=%dA",
+                     (hyst - id(auto_start_ticks)) * 10, available, target_a);
+            if (id(auto_start_ticks) >= hyst) {
+              id(auto_start_ticks) = 0;
+              id(ac011k_hub).set_phases(3);
+              id(ac011k_hub).set_current_limit((uint8_t)target_a);
+              id(ac011k_hub).start_charging();
+            }
+          } else if (charging && !enough) {
+            id(auto_start_ticks) = 0;
+            id(auto_stop_ticks)  = id(auto_stop_ticks) + 1;
+            ESP_LOGI("solar", "stop in %ds  available=%.0fW",
+                     (hyst - id(auto_stop_ticks)) * 10, available);
+            if (id(auto_stop_ticks) >= hyst) {
+              id(auto_stop_ticks) = 0;
+              id(ac011k_hub).stop_charging();
+            }
+          } else if (charging && enough) {
+            id(auto_start_ticks) = 0;
+            id(auto_stop_ticks)  = 0;
+            id(ac011k_hub).set_phases(3);
+            id(ac011k_hub).set_current_limit((uint8_t)target_a);
+          } else {
+            // not charging, not enough — wait
+            id(auto_start_ticks) = 0;
+            id(auto_stop_ticks)  = 0;
+          }
 
 # ── Core logic script ──────────────────────────────────────────────────────────
 script:
