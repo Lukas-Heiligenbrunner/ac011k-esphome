@@ -37,7 +37,7 @@ static inline uint16_t get_u16(const uint8_t *buf, int i) {
 // dir: "TX" or "RX"
 static void log_frame(const char *dir, const uint8_t *frame, size_t len) {
     // Hex dump (max 64 bytes shown)
-    char hex[3 * 64 + 1];
+    char hex[3 * 64 + 4];  // +4 for the "..." truncation marker written by snprintf
     size_t show = len < 64 ? len : 64;
     for (size_t i = 0; i < show; i++)
         snprintf(hex + 3 * i, 4, "%02X ", frame[i]);

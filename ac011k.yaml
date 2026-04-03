@@ -314,7 +314,7 @@ interval:
           if (isnan(id(grid_power).state))  return;  // no HA connection yet
 
           const float buffer_w = 500.0f;
-          const float v_total  = 230.0f * (id(installed_phases).state == "1" ? 1.0f : 3.0f);
+          const float v_total  = 230.0f * (id(installed_phases).current_option() == "1" ? 1.0f : 3.0f);
           const int   min_a    = 6;
           const int   max_a    = 16;
           
