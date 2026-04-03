@@ -18,9 +18,6 @@ esphome:
   name: ac011k-charger
   friendly_name: "EN+ AC011K EV Charger"
   name_add_mac_suffix: true
-  project:
-    name: esphome.ac011k-charger
-    version: "1.0"
 
 esp32:
   board: esp32dev
@@ -153,8 +150,8 @@ sensor:
     lambda: |-
       if (isnan(id(grid_power).state)) return NAN;
       float c = isnan(id(charger_power).state) ? 0.0f : id(charger_power).state;
-      // available = what the charger can use without importing, minus 500W safety buffer
       return c - id(grid_power).state - 500.0f;
+      // Note: "enough to start" = this value >= 6A * phases * 230V
 
 # ── EVSE state text sensor ─────────────────────────────────────────────────────
 text_sensor:
@@ -246,6 +243,18 @@ switch:
             - lambda: 'id(ac011k_hub).stop_charging();'
 
 
+select:
+  - platform: template
+    name: "Installed Phases"
+    id: installed_phases
+    icon: mdi:sine-wave
+    options:
+      - "1"
+      - "3"
+    initial_option: "3"
+    optimistic: true
+    restore_value: true
+
 number:
   - platform: template
     name: "Target Charging Current"
@@ -293,7 +302,7 @@ interval:
           if (isnan(id(grid_power).state))  return;  // no HA connection yet
 
           const float buffer_w = 500.0f;
-          const float v_total  = 230.0f * 3.0f;      // 3-phase at 230 V/phase
+          const float v_total  = 230.0f * (id(installed_phases).state == "1" ? 1.0f : 3.0f);
           const int   min_a    = 6;
           const int   max_a    = 16;
           // 3 ticks × 10 s = 30 s hysteresis

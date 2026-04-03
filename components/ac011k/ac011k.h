@@ -218,6 +218,17 @@ static const uint8_t kInit15[]              = {0xAA, 0x18, 0x09, 0x01, 0x00, 0x0
 static const uint8_t kClearChargingProfile[] = {0xAA, 0x18, 0x24, 0x05, 0x00,
                                                  0xFF,0xFF,0xFF,0xFF, 0x55};
 static const uint8_t kGetMaxCurrLimit[]     = {0xAA, 0x10, 0x0B, 0x00, 0x00};
+// Raise the GD32's stored maximum current limit to 16 A (160 dA, uint32_le).
+// GetMaxCurrLimit was returning 100 dA (10 A) — likely set by the installer.
+// The GD32 silently clamps any 0xAF current request to this value, so
+// without this, charging is capped at 10 A regardless of what we send.
+static const uint8_t kSetMaxCurrLimit[]     = {0xAA, 0x18, 0x0B, 0x04, 0x00, 0xA0, 0x00, 0x00, 0x00}; // 160 dA = 16.0 A
+// Disable GD32 internal PV charging mode (PVchgmode=0) so it doesn't override our 0xAF limit.
+// Values from GetMeterCfg response: metertype=10, meterpro=20, msxCurr=1000, PVchgmode=0, setChgCurr=0
+// Without this, the GD32's PV algorithm (configured with an external RS485 meter that no longer
+// exists) falls back to a conservative current cap (~9.4A) and ignores our 0xAF requests.
+static const uint8_t kSetMeterCfg[]        = {0xAA, 0x18, 0x42, 0x07, 0x00,
+                                               0x0A, 0x14, 0xE8, 0x03, 0x00, 0x00, 0x00};
 
 // ── Charging control ──────────────────────────────────────────────────────────
 // StartChargingA6: WARP charger identity string + start flag 0x30 at byte 65
@@ -348,11 +359,9 @@ public:
         send_frame(kSetSmartparam,        sizeof(kSetSmartparam),        seq_++);
         send_frame(kGetRtc,               sizeof(kGetRtc),               seq_++);
         send_frame(kSetReset,             sizeof(kSetReset),             seq_++);
-        send_frame(kSetHbTimeout,         sizeof(kSetHbTimeout),         seq_++);
-        send_frame(kInit15,               sizeof(kInit15),               seq_++);
-        send_frame(kSetGunTime,           sizeof(kSetGunTime),           seq_++);  // sent twice in original
-        send_frame(kClearChargingProfile, sizeof(kClearChargingProfile), seq_++);
-        send_frame(kGetMaxCurrLimit,      sizeof(kGetMaxCurrLimit),      seq_++);
+        // Post-reset config (kSetMeterCfg, kSetHbTimeout, kInit15, kSetGunTime,
+        // kClearChargingProfile, kGetMaxCurrLimit) is sent in the case 0x02 handler,
+        // after the GD32 finishes rebooting and sends 0x02 InfoSync.
     }
 
     void loop() override {
@@ -485,6 +494,17 @@ private:
                          (const char *)buf + 43,
                          (const char *)buf + 91);
                 send_ack(cmd, seq);  // reply with 0xA2
+                // GD32 has finished rebooting (kSetReset triggered this 0x02).
+                // Commands sent after kSetReset but before this 0x02 are unreliable —
+                // the GD32 may have been resetting when they arrived. Send all
+                // post-reset config here instead.
+                send_frame(kSetMeterCfg,          sizeof(kSetMeterCfg),          seq_++);  // disable PVchgmode
+                send_frame(kSetHbTimeout,         sizeof(kSetHbTimeout),         seq_++);
+                send_frame(kInit15,               sizeof(kInit15),               seq_++);
+                send_frame(kSetGunTime,           sizeof(kSetGunTime),           seq_++);
+                send_frame(kClearChargingProfile, sizeof(kClearChargingProfile), seq_++);
+                send_frame(kSetMaxCurrLimit,      sizeof(kSetMaxCurrLimit),      seq_++);  // raise cap to 16 A
+                send_frame(kGetMaxCurrLimit,      sizeof(kGetMaxCurrLimit),      seq_++);
                 break;
 
             case 0x03:  // Status update from GD
@@ -536,7 +556,15 @@ private:
                 break;
 
             case 0x0A:  // Ack for AA control commands (config, time, etc.)
-                ESP_LOGD(TAG, "AA ctrl ack type=0x%02X", buf[9]);
+                if (buf[9] == 0x24)
+                    ESP_LOGI(TAG, "ClearChargingProfile ack");
+                else if (buf[9] == 0x0B) {
+                    // Both GetMaxCurrLimit and SetMaxCurrLimit ack with sub=0x0B,
+                    // value at buf[12..15] uint32_le in deciamps (160 = 16.0 A).
+                    uint32_t val = (uint32_t)(buf[12] | (buf[13]<<8) | (buf[14]<<16) | (buf[15]<<24));
+                    ESP_LOGI(TAG, "MaxCurrLimit: %u dA (%.1f A)", (unsigned)val, val / 10.0f);
+                } else
+                    ESP_LOGD(TAG, "AA ctrl ack sub=0x%02X", buf[9]);
                 break;
 
             case 0x0C:  // Ack for AC control commands
@@ -547,8 +575,23 @@ private:
                 ESP_LOGD(TAG, "Charging limit ack");
                 break;
 
-            case 0x0E:  // ClockAlignedExtData — extended meter/session report (no reply required)
-                ESP_LOGD(TAG, "ClockAlignedExtData (extended meter block)");
+            case 0x0E:  // ChargingParameterRpt — CP pilot, power factors, temps, etc.
+                // Field offsets (from warp firmware, relative to frame start = 0xFA):
+                //   [9..10]   power factor L1 (uint16_le)
+                //   [11..12]  power factor L2
+                //   [13..14]  power factor L3
+                //   [15..16]  power factor total
+                //   [17..18]  CP PWM duty cycle (uint16_le)
+                //   [19..20]  CP voltage
+                // IEC 61851-1: I_max(A) = duty_pct * 0.6, duty_pct = raw / 10.0
+                //   (GD32 stores duty in 0.1% units: e.g. 167 → 16.7% → 10.0 A)
+                if (rx_len_ >= 12) {
+                    uint16_t duty = (uint16_t)(buf[17] | ((uint16_t)buf[18] << 8));
+                    float pilot_a = duty * 0.06f;  // = (duty/10.0) * 0.6
+                    ESP_LOGI(TAG, "ChargingParameterRpt CP_duty=%u → %.1f A pilot", duty, pilot_a);
+                } else {
+                    ESP_LOGD(TAG, "ChargingParameterRpt (short len=%d)", rx_len_);
+                }
                 break;
 
             case 0x0F:  // GD requests current charging schedule — reply with received seq
