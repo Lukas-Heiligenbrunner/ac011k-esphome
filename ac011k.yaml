@@ -143,6 +143,14 @@ sensor:
     icon: mdi:transmission-tower
     # Positive = importing from grid, negative = exporting (excess solar)
 
+  - platform: homeassistant
+    id: battery_power
+    entity_id: sensor.shelly1pmminig3_hausakku_switch_0_power
+    internal: true
+    # Positive = battery charging, negative = battery discharging.
+    # Added to available power so the car can use battery charge budget,
+    # but never draws power when the battery is discharging.
+
   - platform: template
     name: "Solar Excess Power"
     id: solar_excess_power
@@ -153,7 +161,8 @@ sensor:
     lambda: |-
       if (isnan(id(grid_power).state)) return NAN;
       float c = isnan(id(charger_power).state) ? 0.0f : id(charger_power).state;
-      return c - id(grid_power).state - 500.0f;
+      float b = isnan(id(battery_power).state) ? 0.0f : id(battery_power).state;
+      return c - id(grid_power).state - 500.0f + b;
       // Note: "enough to start" = this value >= 6A * phases * 230V
 
 # ── EVSE state text sensor ─────────────────────────────────────────────────────
@@ -314,8 +323,11 @@ interval:
           const int   hyst_stop  = 24;  // 240 seconds (4 minutes)
 
           float c = isnan(id(charger_power).state) ? 0.0f : id(charger_power).state;
-          // available = solar surplus available to the charger, after buffer
-          float available = c - id(grid_power).state - buffer_w;
+          float b = isnan(id(battery_power).state) ? 0.0f : id(battery_power).state;
+          // available = solar surplus available to the charger, after buffer.
+          // Adding battery_power: positive (charging) makes those watts available for
+          // the car; negative (discharging) reduces available to prevent drawing from battery.
+          float available = c - id(grid_power).state - buffer_w + b;
           int target_a = (int)(available / v_total);
           
           // Clamp target current
