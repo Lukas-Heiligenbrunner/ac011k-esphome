@@ -48,6 +48,9 @@ ota:
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
+  fast_connect: true
+  power_save_mode: none
+  post_connect_roaming: true
   ap:
     ssid: "ac011k-fallback"
     password: !secret fallback_ap_password
@@ -305,13 +308,17 @@ interval:
           const float v_total  = 230.0f * (id(installed_phases).state == "1" ? 1.0f : 3.0f);
           const int   min_a    = 6;
           const int   max_a    = 16;
+          
           // 3 ticks × 10 s = 30 s hysteresis
-          const int   hyst     = 3;
+          const int   hyst_start = 6;   // 60 seconds
+          const int   hyst_stop  = 24;  // 240 seconds (4 minutes)
 
           float c = isnan(id(charger_power).state) ? 0.0f : id(charger_power).state;
           // available = solar surplus available to the charger, after buffer
           float available = c - id(grid_power).state - buffer_w;
           int target_a = (int)(available / v_total);
+          
+          // Clamp target current
           if (target_a < min_a) target_a = min_a;
           if (target_a > max_a) target_a = max_a;
 
@@ -326,32 +333,40 @@ interval:
           }
 
           if (!charging && enough) {
-            id(auto_stop_ticks)  = 0;
-            id(auto_start_ticks) = id(auto_start_ticks) + 1;
-            ESP_LOGI("solar", "start in %ds  available=%.0fW target=%dA",
-                     (hyst - id(auto_start_ticks)) * 10, available, target_a);
-            if (id(auto_start_ticks) >= hyst) {
+            id(auto_stop_ticks)  = 0; // Reset stop counter
+            id(auto_start_ticks)++;
+          
+            ESP_LOGI("solar", "Start timer: %ds/%ds | Available: %.0fW", 
+                     id(auto_start_ticks) * 10, hyst_start * 10, available);
+
+            if (id(auto_start_ticks) >= hyst_start) {
               id(auto_start_ticks) = 0;
               id(ac011k_hub).set_phases(3);
               id(ac011k_hub).set_current_limit((uint8_t)target_a);
               id(ac011k_hub).start_charging();
+              ESP_LOGW("solar", "Hysteresis met: Starting Charge.");
             }
-          } else if (charging && !enough) {
-            id(auto_start_ticks) = 0;
-            id(auto_stop_ticks)  = id(auto_stop_ticks) + 1;
-            ESP_LOGI("solar", "stop in %ds  available=%.0fW",
-                     (hyst - id(auto_stop_ticks)) * 10, available);
-            if (id(auto_stop_ticks) >= hyst) {
+          }
+          else if (charging && !enough) {
+            id(auto_start_ticks) = 0; // Reset start counter
+            id(auto_stop_ticks)++;
+          
+            ESP_LOGI("solar", "Stop timer: %ds/%ds | Shortage: %.0fW", 
+                     id(auto_stop_ticks) * 10, hyst_stop * 10, (available - (min_a * v_total)));
+
+            if (id(auto_stop_ticks) >= hyst_stop) {
               id(auto_stop_ticks) = 0;
               id(ac011k_hub).stop_charging();
+              ESP_LOGW("solar", "Hysteresis met: Stopping Charge.");
             }
-          } else if (charging && enough) {
+          } 
+          else if (charging && enough) {
             id(auto_start_ticks) = 0;
             id(auto_stop_ticks)  = 0;
             id(ac011k_hub).set_phases(3);
             id(ac011k_hub).set_current_limit((uint8_t)target_a);
-          } else {
-            // not charging, not enough — wait
+          } 
+          else {
             id(auto_start_ticks) = 0;
             id(auto_stop_ticks)  = 0;
           }
