@@ -125,6 +125,7 @@ sensor:
       name: "Charger Total Energy"
     evse_status:
       name: "Charger EVSE Status"
+      id: evse_status_sensor
       entity_category: diagnostic
       # 1=Available  2=Preparing(plugged)  3=Charging  4=Suspended by charger
       # 5=Suspended by EV  6=Finishing  7=Reserved  8=Unavailable  9=Fault
@@ -162,7 +163,7 @@ sensor:
       if (isnan(id(grid_power).state)) return NAN;
       float c = isnan(id(charger_power).state) ? 0.0f : id(charger_power).state;
       float b = isnan(id(battery_power).state) ? 0.0f : id(battery_power).state;
-      return c - id(grid_power).state - 500.0f + b;
+      return c - id(grid_power).state - 250.0f + b;
       // Note: "enough to start" = this value >= 6A * phases * 230V
 
 # ── EVSE state text sensor ─────────────────────────────────────────────────────
@@ -263,7 +264,7 @@ select:
     options:
       - "1"
       - "3"
-    initial_option: "3"
+    initial_option: "1"
     optimistic: true
     restore_value: true
 
@@ -313,8 +314,8 @@ interval:
           if (!id(solar_auto_mode).state) return;
           if (isnan(id(grid_power).state))  return;  // no HA connection yet
 
-          const float buffer_w = 500.0f;
-          const float v_total  = 230.0f * (id(installed_phases).current_option() == "1" ? 1.0f : 3.0f);
+          const float buffer_w = 250.0f;
+          const float v_total  = 230.0f * (id(installed_phases).state == "1" ? 1.0f : 3.0f);
           const int   min_a    = 6;
           const int   max_a    = 16;
           
@@ -328,7 +329,7 @@ interval:
           // Adding battery_power: positive (charging) makes those watts available for
           // the car; negative (discharging) reduces available to prevent drawing from battery.
           float available = c - id(grid_power).state - buffer_w + b;
-          int target_a = (int)(available / v_total);
+          int target_a = (int)(available / v_total + 0.5f);
           
           // Clamp target current
           if (target_a < min_a) target_a = min_a;
@@ -341,6 +342,14 @@ interval:
           if (!plugged) {
             id(auto_start_ticks) = 0;
             id(auto_stop_ticks)  = 0;
+            return;
+          }
+
+          // Skip while EVSE is in a transitional state (start handshake already in progress):
+          // 4=Suspended by Charger, 5=Suspended by EV (CP negotiation with car ongoing)
+          float evse_st = id(evse_status_sensor).state;
+          if (evse_st == 4.0f || evse_st == 5.0f) {
+            ESP_LOGI("solar", "EVSE handshake in progress (status=%.0f), waiting...", evse_st);
             return;
           }
 

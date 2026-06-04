@@ -473,7 +473,8 @@ private:
 
     uint8_t  seq_              = 1;      // outgoing sequence number
     uint8_t  current_limit_a_  = 16;    // amperes
-    uint8_t  phases_           = 3;     // 1 or 3
+    uint8_t  phases_           = 1;     // 1 or 3; updated from 0x08 MeterData voltages
+    uint8_t  evse_status_from_03_ = 0;  // last EVSE status from 0x03 StatusUpdate (authoritative)
     uint32_t tx_num_           = 100000; // transaction number (embedded in A6/A7 cmds)
 
     // Mutable command buffers with transaction number patched in at setup()
@@ -509,6 +510,7 @@ private:
 
             case 0x03:  // Status update from GD
                 // buf[9] = EVSE status code (1-9)
+                evse_status_from_03_ = buf[9];
                 update_status(buf[9]);
                 send_time_ack(0xA3, 0x10, 8, seq);
                 break;
@@ -542,7 +544,13 @@ private:
             case 0x08: {  // ClockAlignedData — meter readings, ~10s interval
                 // buf[77] = EVSE status (< 10 = valid status message)
                 if (buf[77] < 10) {
-                    update_status(buf[77]);
+                    // The GD32 briefly reports evse=1 (Available) in 0x08 MeterData
+                    // during InfoSync restart cycles even when the cable is still plugged.
+                    // 0x03 StatusUpdate is the authoritative source for plug state;
+                    // don't let 0x08 downgrade to Available while 0x03 says plugged.
+                    uint8_t st = (buf[77] == 1 && evse_status_from_03_ >= 2)
+                                 ? evse_status_from_03_ : buf[77];
+                    update_status(st);
                     publish_meter(buf);
                 }
                 send_time_ack(0xA8, 0x40, 12, seq);
