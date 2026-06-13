@@ -99,6 +99,12 @@ globals:
   - id: auto_stop_ticks    # counts 10s intervals with insufficient excess while charging
     type: int
     initial_value: '0'
+  - id: last_current_a     # last current limit (A) commanded by solar auto mode
+    type: int
+    initial_value: '0'
+  - id: curr_change_cooldown  # ticks remaining before the next current change is allowed
+    type: int
+    initial_value: '0'
 
 # ── Meter sensors ──────────────────────────────────────────────────────────────
 sensor:
@@ -165,6 +171,25 @@ sensor:
       float b = isnan(id(battery_power).state) ? 0.0f : id(battery_power).state;
       return c - id(grid_power).state - 250.0f + b;
       // Note: "enough to start" = this value >= 6A * phases * 230V
+
+  # Smoothed surplus — this is what the solar auto controller actually acts on.
+  # On fast-cloud days the raw surplus swings ±3 kW within seconds; the EV (and the
+  # sensor chain) cannot follow that, so chasing it causes out-of-phase hunting and
+  # grid import. We deliberately track the ~90 s moving average instead and let the
+  # house battery absorb the fast transients (battery = fast loop, EV = slow loop).
+  # alpha 0.1 @ 10 s updates ≈ time constant ~95 s.
+  - platform: template
+    name: "Solar Excess Power (smoothed)"
+    id: solar_excess_smoothed
+    unit_of_measurement: "W"
+    icon: mdi:solar-power-variant
+    accuracy_decimals: 0
+    update_interval: 10s
+    lambda: 'return id(solar_excess_power).state;'
+    filters:
+      - exponential_moving_average:
+          alpha: 0.1
+          send_every: 1
 
 # ── EVSE state text sensor ─────────────────────────────────────────────────────
 text_sensor:
@@ -284,6 +309,22 @@ number:
       - lambda: 'id(target_current).publish_state(x);'
       - script.execute: apply_charging_settings
 
+  # How much the house battery may discharge to feed the car before the car backs off.
+  # Lower = gentler on the battery (car reacts faster to dips); higher = battery rides the
+  # car through bigger dips. Capped at the Hyper 2000's ~1200 W discharge limit.
+  # Solar auto mode only.
+  - platform: template
+    name: "Max Battery Discharge for Car"
+    id: batt_discharge_allow
+    unit_of_measurement: "W"
+    icon: mdi:battery-arrow-down
+    min_value: 0
+    max_value: 2400
+    step: 100
+    initial_value: 300
+    optimistic: true
+    restore_value: true
+
 button:
   - platform: template
     name: "Start Charging"
@@ -312,32 +353,46 @@ interval:
     then:
       - lambda: |-
           if (!id(solar_auto_mode).state) return;
-          if (isnan(id(grid_power).state))  return;  // no HA connection yet
 
-          const float buffer_w = 250.0f;
+          // Act on the SMOOTHED surplus (≈90 s avg), not the raw signal. Fast cloud
+          // transients (±3 kW in seconds) are impossible for the EV to follow; chasing
+          // them just produces out-of-phase hunting and grid import. The house battery
+          // handles the fast residual; the EV tracks the slow average.
+          float available = id(solar_excess_smoothed).state;
+          if (isnan(available)) return;  // no data yet
+
+          // Battery-discharge guard (acts on the LIVE battery power, not the EMA, so it
+          // protects the battery promptly). We tolerate a small discharge to ride out
+          // brief dips, but back the car off by anything beyond that allowance so the
+          // house battery isn't drained to feed the car. Net effect: fast-down to protect
+          // the battery, slow-up (via the EMA) when sun returns. Solar auto mode only.
+          float batt = isnan(id(battery_power).state) ? 0.0f : id(battery_power).state; // + charge / - discharge
+          float discharge = batt < 0.0f ? -batt : 0.0f;
+          float allow = id(batt_discharge_allow).state;
+          if (discharge > allow)
+            available -= (discharge - allow);
+
           const float v_total  = 230.0f * (id(installed_phases).state == "1" ? 1.0f : 3.0f);
           const int   min_a    = 6;
           const int   max_a    = 16;
-          
-          // 3 ticks × 10 s = 30 s hysteresis
-          const int   hyst_start = 6;   // 60 seconds
-          const int   hyst_stop  = 24;  // 240 seconds (4 minutes)
 
-          float c = isnan(id(charger_power).state) ? 0.0f : id(charger_power).state;
-          float b = isnan(id(battery_power).state) ? 0.0f : id(battery_power).state;
-          // available = solar surplus available to the charger, after buffer.
-          // Adding battery_power: positive (charging) makes those watts available for
-          // the car; negative (discharging) reduces available to prevent drawing from battery.
-          float available = c - id(grid_power).state - buffer_w + b;
+          // Hysteresis on start/stop (counted in 10 s ticks)
+          const int   hyst_start = 6;   // 60 seconds of sustained surplus
+          const int   hyst_stop  = 24;  // 240 seconds of sustained shortage
+
+          // Minimum dwell between current changes, to stop ±1 A dithering at the
+          // boundary between two amp levels (3 ticks = 30 s).
+          const int   change_cooldown = 3;
+
           int target_a = (int)(available / v_total + 0.5f);
-          
-          // Clamp target current
           if (target_a < min_a) target_a = min_a;
           if (target_a > max_a) target_a = max_a;
 
           bool enough   = available >= (float)min_a * v_total;
           bool charging = id(ev_charging).state;
           bool plugged  = id(ev_plugged).state;
+
+          if (id(curr_change_cooldown) > 0) id(curr_change_cooldown)--;
 
           if (!plugged) {
             id(auto_start_ticks) = 0;
@@ -356,23 +411,26 @@ interval:
           if (!charging && enough) {
             id(auto_stop_ticks)  = 0; // Reset stop counter
             id(auto_start_ticks)++;
-          
-            ESP_LOGI("solar", "Start timer: %ds/%ds | Available: %.0fW", 
+
+            ESP_LOGI("solar", "Start timer: %ds/%ds | Avg surplus: %.0fW",
                      id(auto_start_ticks) * 10, hyst_start * 10, available);
 
             if (id(auto_start_ticks) >= hyst_start) {
               id(auto_start_ticks) = 0;
               id(ac011k_hub).set_phases(3);
               id(ac011k_hub).set_current_limit((uint8_t)target_a);
+              id(last_current_a) = target_a;
+              id(curr_change_cooldown) = change_cooldown;
               id(ac011k_hub).start_charging();
-              ESP_LOGW("solar", "Hysteresis met: Starting Charge.");
+              ESP_LOGW("solar", "Hysteresis met: starting charge at %dA (avg surplus %.0fW).",
+                       target_a, available);
             }
           }
           else if (charging && !enough) {
             id(auto_start_ticks) = 0; // Reset start counter
             id(auto_stop_ticks)++;
-          
-            ESP_LOGI("solar", "Stop timer: %ds/%ds | Shortage: %.0fW", 
+
+            ESP_LOGI("solar", "Stop timer: %ds/%ds | Shortage: %.0fW",
                      id(auto_stop_ticks) * 10, hyst_stop * 10, (available - (min_a * v_total)));
 
             if (id(auto_stop_ticks) >= hyst_stop) {
@@ -380,13 +438,20 @@ interval:
               id(ac011k_hub).stop_charging();
               ESP_LOGW("solar", "Hysteresis met: Stopping Charge.");
             }
-          } 
+          }
           else if (charging && enough) {
             id(auto_start_ticks) = 0;
             id(auto_stop_ticks)  = 0;
-            id(ac011k_hub).set_phases(3);
-            id(ac011k_hub).set_current_limit((uint8_t)target_a);
-          } 
+            // Deadband + cooldown: only retune when the smoothed target actually moved
+            // and not more often than every 30 s.
+            if (target_a != id(last_current_a) && id(curr_change_cooldown) == 0) {
+              ESP_LOGI("solar", "Adjust current %dA -> %dA (avg surplus %.0fW)",
+                       id(last_current_a), target_a, available);
+              id(ac011k_hub).set_current_limit((uint8_t)target_a);
+              id(last_current_a) = target_a;
+              id(curr_change_cooldown) = change_cooldown;
+            }
+          }
           else {
             id(auto_start_ticks) = 0;
             id(auto_stop_ticks)  = 0;
@@ -401,3 +466,6 @@ script:
           ESP_LOGI("ac011k", "apply: %d A", amps);
           id(ac011k_hub).set_phases(3);
           id(ac011k_hub).set_current_limit(amps);
+          // Keep solar-mode bookkeeping in sync so its deadband doesn't fight a manual change.
+          id(last_current_a) = amps;
+          id(curr_change_cooldown) = 3;
