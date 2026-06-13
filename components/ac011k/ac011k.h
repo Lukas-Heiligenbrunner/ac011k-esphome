@@ -33,6 +33,11 @@ static inline uint16_t get_u16(const uint8_t *buf, int i) {
     return (uint16_t)(buf[i] | ((uint16_t)buf[i + 1] << 8));
 }
 
+static inline uint32_t get_u32(const uint8_t *buf, int i) {
+    return (uint32_t)buf[i] | ((uint32_t)buf[i + 1] << 8) |
+           ((uint32_t)buf[i + 2] << 16) | ((uint32_t)buf[i + 3] << 24);
+}
+
 // Log up to 32 bytes of a frame as hex + a decoded one-liner at DEBUG level.
 // dir: "TX" or "RX"
 static void log_frame(const char *dir, const uint8_t *frame, size_t len) {
@@ -640,8 +645,8 @@ private:
     //
     // Byte offsets (from start of raw RX frame, FA=0):
     //   [77]      EVSE status
-    //   [84..85]  Session energy (Wh)       → kWh
-    //   [88..89]  Total energy (Wh)         → kWh (resets on GD reboot)
+    //   [84..87]  Session energy (Wh), uint32 → kWh
+    //   [88..91]  Total energy (Wh), uint32   → kWh (resets on GD reboot)
     //   [96..97]  Charging power (W)
     //   [100..101] L1 voltage ×10
     //   [102..103] L2 voltage ×10
@@ -658,8 +663,8 @@ private:
         if (s_current_l1_  != nullptr) s_current_l1_  ->publish_state(get_u16(buf, 106) / 10.0f);
         if (s_current_l2_  != nullptr) s_current_l2_  ->publish_state(get_u16(buf, 108) / 10.0f);
         if (s_current_l3_  != nullptr) s_current_l3_  ->publish_state(get_u16(buf, 110) / 10.0f);
-        if (s_energy_sess_ != nullptr) s_energy_sess_ ->publish_state(get_u16(buf, 84)  / 1000.0f);
-        if (s_energy_total_!= nullptr) s_energy_total_->publish_state(get_u16(buf, 88)  / 1000.0f);
+        if (s_energy_sess_ != nullptr) s_energy_sess_ ->publish_state(get_u32(buf, 84)  / 1000.0f);
+        if (s_energy_total_!= nullptr) s_energy_total_->publish_state(get_u32(buf, 88)  / 1000.0f);
         // Count active phases from voltages. Only updates during active charging.
         {
             uint8_t p = 0;

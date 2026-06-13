@@ -256,10 +256,8 @@ Only valid if `buf[77] < 10` (otherwise it is an RFID-type sub-message).
 | Offset | Content | Unit | Scale |
 |--------|---------|------|-------|
 | 77 | EVSE status code | — | 1 |
-| 84..85 | Session energy | Wh | raw ÷ 1000 = kWh |
-| 86..87 | (unknown) | — | — |
-| 88..89 | Total energy (resets on GD reboot) | Wh | raw ÷ 1000 = kWh |
-| 90..91 | (unknown) | — | — |
+| 84..87 | Session energy (uint32 LE) | Wh | raw ÷ 1000 = kWh |
+| 88..91 | Total energy (resets on GD reboot, uint32 LE) | Wh | raw ÷ 1000 = kWh |
 | 92..93 | (unknown) | — | — |
 | 94..95 | (unknown) | — | — |
 | 96..97 | Charging power | W | 1 |
