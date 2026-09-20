@@ -353,7 +353,7 @@ public:
         snprintf((char *)stop_a7_ + 1, 7, "%06d", (int)tx_num_);
         stop_a7_[33] = 0x10;  // stop confirmation flag
 
-        ESP_LOGI(TAG, "Sending PrivComm init sequence (txnum=%d)", tx_num_);
+        ESP_LOGI(TAG, "Sending PrivComm init sequence (txnum=%d)", (int)tx_num_);
         send_frame(kSetRemoteStart,       sizeof(kSetRemoteStart),       seq_++);
         send_frame(kSetS2OpenStop,        sizeof(kSetS2OpenStop),        seq_++);
         send_frame(kSetS2OpenLock,        sizeof(kSetS2OpenLock),        seq_++);
