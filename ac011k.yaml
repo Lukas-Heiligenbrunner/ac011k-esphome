@@ -23,10 +23,14 @@ esp32:
   board: esp32dev
   framework:
     type: esp-idf
+    advanced:
+      minimum_chip_revision: "3.1"
+      sram1_as_iram: true
 
 psram:
   mode: quad   # ESP32-D0WD: quad-SPI PSRAM
   speed: 40MHz
+  ignore_not_found: false
 
 external_components:
   - source:
@@ -43,7 +47,8 @@ api:
 
 ota:
   - platform: esphome
-    password: !secret ota_password
+    encryption:
+      key: !secret ota_password
 
 wifi:
   ssid: !secret wifi_ssid
